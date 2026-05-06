@@ -1,5 +1,14 @@
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
+};
+
 use redis::Commands;
 use serde::{Deserialize, Serialize};
+
+pub const DEFAULT_PROMPT_DIR: &str = "prompt";
+const SYSTEM_PROMPT_FILE: &str = "system.yaml";
 
 pub struct ShortTermMemory {
     connection: redis::Connection,
@@ -13,6 +22,18 @@ pub enum MemoryError {
 
     #[error(transparent)]
     Json(#[from] serde_json::Error),
+
+    #[error("{0}")]
+    InvalidInput(&'static str),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum PromptArchiveError {
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+
+    #[error(transparent)]
+    Yaml(#[from] serde_yaml::Error),
 
     #[error("{0}")]
     InvalidInput(&'static str),
@@ -36,13 +57,47 @@ impl std::fmt::Display for ChatRole {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ChatEntry {
+    #[serde(default)]
+    pub user_id: String,
+    #[serde(default)]
+    pub session_id: String,
+    #[serde(default)]
+    pub timestamp: u64,
     pub role: ChatRole,
     pub content: String,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct SystemPromptArchiveEntry {
+    role: String,
+    prompt: String,
+}
+
 impl ChatEntry {
     pub fn new(role: ChatRole, content: impl Into<String>) -> Self {
+        Self::with_metadata("", "", 0, role, content)
+    }
+
+    pub fn for_session(
+        user_id: &str,
+        session_id: &str,
+        role: ChatRole,
+        content: impl Into<String>,
+    ) -> Self {
+        Self::with_metadata(user_id, session_id, unix_timestamp_seconds(), role, content)
+    }
+
+    pub fn with_metadata(
+        user_id: impl Into<String>,
+        session_id: impl Into<String>,
+        timestamp: u64,
+        role: ChatRole,
+        content: impl Into<String>,
+    ) -> Self {
         Self {
+            user_id: user_id.into(),
+            session_id: session_id.into(),
+            timestamp,
             role,
             content: content.into(),
         }
@@ -130,6 +185,30 @@ impl ShortTermMemory {
     }
 }
 
+pub fn save_system_prompt_yaml(
+    prompt_dir: impl AsRef<Path>,
+    prompt: &str,
+) -> Result<PathBuf, PromptArchiveError> {
+    if prompt.trim().is_empty() {
+        return Err(PromptArchiveError::InvalidInput(
+            "system prompt cannot be empty",
+        ));
+    }
+
+    let prompt_dir = prompt_dir.as_ref();
+    fs::create_dir_all(prompt_dir)?;
+
+    let archive_entry = SystemPromptArchiveEntry {
+        role: "system".to_string(),
+        prompt: prompt.to_string(),
+    };
+    let yaml = serde_yaml::to_string(&archive_entry)?;
+    let path = prompt_dir.join(SYSTEM_PROMPT_FILE);
+    fs::write(&path, yaml)?;
+
+    Ok(path)
+}
+
 pub fn search_entries(entries: Vec<ChatEntry>, query: &str) -> Vec<ChatEntry> {
     let query = query.to_lowercase();
 
@@ -145,6 +224,13 @@ fn normalize_namespace(namespace: &str) -> String {
 
 fn namespaced_key(namespace: &str, key: &str) -> String {
     format!("{}:{}", namespace, key)
+}
+
+fn unix_timestamp_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 #[cfg(test)]
@@ -178,6 +264,50 @@ mod tests {
     }
 
     #[test]
+    fn creates_chat_entries_with_user_session_and_timestamp() {
+        let before = unix_timestamp_seconds();
+        let entry = ChatEntry::for_session("soonmo", "work", ChatRole::User, "hello");
+        let after = unix_timestamp_seconds();
+
+        assert_eq!(entry.user_id, "soonmo");
+        assert_eq!(entry.session_id, "work");
+        assert!(entry.timestamp >= before);
+        assert!(entry.timestamp <= after);
+    }
+
+    #[test]
+    fn reads_legacy_chat_entries_without_metadata() {
+        let entry: ChatEntry =
+            serde_json::from_str(r#"{"role":"user","content":"legacy"}"#).unwrap();
+
+        assert_eq!(entry, ChatEntry::new(ChatRole::User, "legacy"));
+    }
+
+    #[test]
+    fn saves_system_prompt_as_yaml() {
+        let prompt_dir = std::env::temp_dir().join(format!(
+            "agent-memory-system-prompt-test-{}-{}",
+            unix_timestamp_seconds(),
+            std::process::id()
+        ));
+
+        let path = save_system_prompt_yaml(&prompt_dir, "system instructions").unwrap();
+        let yaml = std::fs::read_to_string(path).unwrap();
+        let saved: SystemPromptArchiveEntry = serde_yaml::from_str(&yaml).unwrap();
+
+        assert_eq!(
+            saved,
+            SystemPromptArchiveEntry {
+                role: "system".to_string(),
+                prompt: "system instructions".to_string(),
+            }
+        );
+        assert!(prompt_dir.join("system.yaml").exists());
+
+        std::fs::remove_dir_all(prompt_dir).unwrap();
+    }
+
+    #[test]
     #[ignore = "requires a Valkey server at VALKEY_URL or redis://127.0.0.1:6379/"]
     fn remembers_recalls_and_forgets_with_valkey() {
         let url =
@@ -204,20 +334,23 @@ mod tests {
         let mut memory = ShortTermMemory::connect(&url, "agent:test").unwrap();
 
         memory.forget("chat:integration-session").unwrap();
+        let entry = ChatEntry::with_metadata(
+            "soonmo",
+            "integration-session",
+            1,
+            ChatRole::User,
+            "Searchable Valkey message",
+        );
+
         memory
-            .append_chat_entry(
-                "integration-session",
-                ChatEntry::new(ChatRole::User, "Searchable Valkey message"),
-                10,
-                30,
-            )
+            .append_chat_entry("integration-session", entry.clone(), 10, 30)
             .unwrap();
 
         assert_eq!(
             memory
                 .search_chat_history("integration-session", "valkey")
                 .unwrap(),
-            vec![ChatEntry::new(ChatRole::User, "Searchable Valkey message")]
+            vec![entry]
         );
 
         memory.forget("chat:integration-session").unwrap();
