@@ -21,6 +21,7 @@ use rig::{
     },
 };
 
+#[derive(Clone)]
 pub struct LlmClient {
     client: Client<OpenAIConfig>,
     model: String,
