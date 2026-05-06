@@ -1,18 +1,78 @@
-use std::time::Duration;
+use std::{fmt, time::Duration};
 
 use agent_memory::{ChatEntry, ChatRole};
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use async_openai::{
     Client,
     config::OpenAIConfig,
     types::chat::{
         ChatCompletionRequestAssistantMessageArgs, ChatCompletionRequestMessage,
         ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestUserMessageArgs,
-        CreateChatCompletionRequestArgs,
+        CreateChatCompletionRequest, CreateChatCompletionRequestArgs,
+        ReasoningEffort as OpenAiReasoningEffort,
     },
 };
+use clap::ValueEnum;
 
 const DEFAULT_CHAT_TIMEOUT_SECONDS: u64 = 30;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+#[value(rename_all = "lower")]
+pub enum ReasoningEffort {
+    None,
+    Minimal,
+    Low,
+    Medium,
+    High,
+    Xhigh,
+}
+
+impl ReasoningEffort {
+    pub fn from_env_value(value: Option<&str>) -> Result<Option<Self>> {
+        value.map(Self::parse).transpose()
+    }
+
+    fn parse(value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "none" => Ok(Self::None),
+            "minimal" => Ok(Self::Minimal),
+            "low" => Ok(Self::Low),
+            "medium" => Ok(Self::Medium),
+            "high" => Ok(Self::High),
+            "xhigh" => Ok(Self::Xhigh),
+            _ => bail!(
+                "LLM_REASONING_EFFORT must be one of: none, minimal, low, medium, high, xhigh"
+            ),
+        }
+    }
+
+    fn to_openai(self) -> OpenAiReasoningEffort {
+        match self {
+            Self::None => OpenAiReasoningEffort::None,
+            Self::Minimal => OpenAiReasoningEffort::Minimal,
+            Self::Low => OpenAiReasoningEffort::Low,
+            Self::Medium => OpenAiReasoningEffort::Medium,
+            Self::High => OpenAiReasoningEffort::High,
+            Self::Xhigh => OpenAiReasoningEffort::Xhigh,
+        }
+    }
+}
+
+impl fmt::Display for ReasoningEffort {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let value = match self {
+            Self::None => "none",
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Xhigh => "xhigh",
+        };
+
+        formatter.write_str(value)
+    }
+}
+
 use rig::{
     OneOrMany,
     completion::{
@@ -26,10 +86,15 @@ pub struct LlmClient {
     client: Client<OpenAIConfig>,
     model: String,
     preamble: &'static str,
+    reasoning_effort: Option<ReasoningEffort>,
 }
 
 impl LlmClient {
-    pub fn from_env(model: String, preamble: &'static str) -> Self {
+    pub fn from_env(
+        model: String,
+        preamble: &'static str,
+        reasoning_effort: Option<ReasoningEffort>,
+    ) -> Self {
         let mut config = OpenAIConfig::new();
         let openai_api_key = std::env::var("OPENAI_API_KEY").ok();
 
@@ -54,16 +119,14 @@ impl LlmClient {
             client: Client::with_config(config),
             model,
             preamble,
+            reasoning_effort,
         }
     }
 
     pub async fn chat(&self, history: &[ChatEntry], prompt: &str) -> Result<String> {
         let workflow_messages = rig_workflow_messages(self.preamble, history, prompt);
-        let request = CreateChatCompletionRequestArgs::default()
-            .model(&self.model)
-            .messages(openai_messages(&workflow_messages)?)
-            .build()
-            .context("failed to build chat completion request")?;
+        let request =
+            chat_completion_request(&self.model, &workflow_messages, self.reasoning_effort)?;
         let response = tokio::time::timeout(chat_timeout(), self.client.chat().create(request))
             .await
             .context("chat completion timed out")?
@@ -76,6 +139,25 @@ impl LlmClient {
             .and_then(|choice| choice.message.content)
             .context("chat completion response did not include assistant text")
     }
+}
+
+fn chat_completion_request(
+    model: &str,
+    workflow_messages: &[RigMessage],
+    reasoning_effort: Option<ReasoningEffort>,
+) -> Result<CreateChatCompletionRequest> {
+    let mut request = CreateChatCompletionRequestArgs::default();
+    request
+        .model(model)
+        .messages(openai_messages(workflow_messages)?);
+
+    if let Some(reasoning_effort) = reasoning_effort {
+        request.reasoning_effort(reasoning_effort.to_openai());
+    }
+
+    request
+        .build()
+        .context("failed to build chat completion request")
 }
 
 fn looks_like_url(value: &str) -> bool {
@@ -214,6 +296,35 @@ mod tests {
             ChatCompletionRequestMessage::Assistant(_)
         ));
         assert!(matches!(messages[3], ChatCompletionRequestMessage::User(_)));
+    }
+
+    #[test]
+    fn chat_request_omits_reasoning_effort_when_unset() {
+        let rig_messages = rig_workflow_messages("system", &[], "next");
+        let request = chat_completion_request("model", &rig_messages, None).unwrap();
+        let value = serde_json::to_value(request).unwrap();
+
+        assert!(value.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn chat_request_includes_reasoning_effort_when_set() {
+        let rig_messages = rig_workflow_messages("system", &[], "next");
+        let request =
+            chat_completion_request("model", &rig_messages, Some(ReasoningEffort::Low)).unwrap();
+        let value = serde_json::to_value(request).unwrap();
+
+        assert_eq!(value["reasoning_effort"], "low");
+    }
+
+    #[test]
+    fn parses_reasoning_effort_from_env_value() {
+        assert_eq!(
+            ReasoningEffort::from_env_value(Some("LOW")).unwrap(),
+            Some(ReasoningEffort::Low)
+        );
+        assert_eq!(ReasoningEffort::from_env_value(None).unwrap(), None);
+        assert!(ReasoningEffort::from_env_value(Some("fast")).is_err());
     }
 
     #[test]

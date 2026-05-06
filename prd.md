@@ -13,6 +13,7 @@
 - user message shows up in the conversation pane as soon as a user typed in.
 - system prompt for agent is saved in prompt folder in a yaml format.
 - what llm does should be shown in tui because response often takes time. And the user will be bored.
+- control reasoning effort of llm for latency.
 
 ## Short term memory
 
