@@ -47,6 +47,9 @@ enum Command {
         #[arg(long, env = "OPENAI_MODEL", default_value = DEFAULT_OPENAI_MODEL)]
         model: String,
 
+        #[arg(long, env = "LLM_REASONING_EFFORT", value_enum)]
+        reasoning_effort: Option<llm::ReasoningEffort>,
+
         #[arg(long, default_value_t = DEFAULT_HISTORY_LIMIT)]
         history_limit: usize,
 
@@ -61,6 +64,9 @@ enum Command {
 
         #[arg(long, env = "OPENAI_MODEL", default_value = DEFAULT_OPENAI_MODEL)]
         model: String,
+
+        #[arg(long, env = "LLM_REASONING_EFFORT", value_enum)]
+        reasoning_effort: Option<llm::ReasoningEffort>,
 
         #[arg(long, default_value_t = DEFAULT_HISTORY_LIMIT)]
         history_limit: usize,
@@ -99,7 +105,10 @@ async fn main() -> Result<()> {
 
     let mut cli = Cli::parse();
     let user_id = cli.user_id.take().unwrap_or_else(|| runtime_id("user"));
-    let command = cli.command.take().unwrap_or_else(default_tui_command);
+    let command = match cli.command.take() {
+        Some(command) => command,
+        None => default_tui_command()?,
+    };
 
     match &command {
         Command::Tui {
@@ -131,6 +140,7 @@ async fn main() -> Result<()> {
         Command::Tui {
             session,
             model,
+            reasoning_effort,
             history_limit,
             ttl_seconds,
         } => {
@@ -143,6 +153,7 @@ async fn main() -> Result<()> {
                     user_id,
                     session,
                     model,
+                    reasoning_effort,
                     history_limit,
                     ttl_seconds,
                     preamble: AGENT_PREAMBLE,
@@ -154,6 +165,7 @@ async fn main() -> Result<()> {
             prompt,
             session,
             model,
+            reasoning_effort,
             history_limit,
             ttl_seconds,
         } => {
@@ -165,7 +177,7 @@ async fn main() -> Result<()> {
                 .context("failed to save system prompt YAML")?;
             let user_entry = ChatEntry::for_session(&user_id, &session, ChatRole::User, prompt);
 
-            let llm = llm::LlmClient::from_env(model, AGENT_PREAMBLE);
+            let llm = llm::LlmClient::from_env(model, AGENT_PREAMBLE, reasoning_effort);
             let response = llm
                 .chat(&history, user_entry.content.as_str())
                 .await
@@ -227,13 +239,24 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn default_tui_command() -> Command {
-    Command::Tui {
+fn default_tui_command() -> Result<Command> {
+    default_tui_command_from_values(
+        std::env::var("OPENAI_MODEL").ok(),
+        std::env::var("LLM_REASONING_EFFORT").ok(),
+    )
+}
+
+fn default_tui_command_from_values(
+    model: Option<String>,
+    reasoning_effort: Option<String>,
+) -> Result<Command> {
+    Ok(Command::Tui {
         session: None,
-        model: std::env::var("OPENAI_MODEL").unwrap_or_else(|_| DEFAULT_OPENAI_MODEL.to_string()),
+        model: model.unwrap_or_else(|| DEFAULT_OPENAI_MODEL.to_string()),
+        reasoning_effort: llm::ReasoningEffort::from_env_value(reasoning_effort.as_deref())?,
         history_limit: DEFAULT_HISTORY_LIMIT,
         ttl_seconds: DEFAULT_CHAT_TTL_SECONDS,
-    }
+    })
 }
 
 fn print_chat_entries(entries: Vec<ChatEntry>) {
@@ -295,8 +318,25 @@ mod tests {
 
     #[test]
     fn default_tui_command_uses_runtime_session_resolution() {
-        match default_tui_command() {
-            Command::Tui { session, .. } => assert_eq!(session, None),
+        match default_tui_command_from_values(None, None).unwrap() {
+            Command::Tui {
+                session,
+                reasoning_effort,
+                ..
+            } => {
+                assert_eq!(session, None);
+                assert_eq!(reasoning_effort, None);
+            }
+            _ => panic!("default command should open the TUI"),
+        }
+    }
+
+    #[test]
+    fn default_tui_command_reads_reasoning_effort_from_env_value() {
+        match default_tui_command_from_values(None, Some("low".to_string())).unwrap() {
+            Command::Tui {
+                reasoning_effort, ..
+            } => assert_eq!(reasoning_effort, Some(llm::ReasoningEffort::Low)),
             _ => panic!("default command should open the TUI"),
         }
     }

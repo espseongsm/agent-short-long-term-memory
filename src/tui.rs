@@ -3,7 +3,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::llm::LlmClient;
+use crate::llm::{LlmClient, ReasoningEffort};
 use agent_memory::{ChatEntry, ChatRole, ShortTermMemory};
 use anyhow::{Context, Result};
 use crossterm::{
@@ -28,6 +28,7 @@ pub struct TuiConfig {
     pub user_id: String,
     pub session: String,
     pub model: String,
+    pub reasoning_effort: Option<ReasoningEffort>,
     pub history_limit: usize,
     pub ttl_seconds: u64,
     pub preamble: &'static str,
@@ -59,7 +60,11 @@ impl App {
 }
 
 pub async fn run(memory: &mut ShortTermMemory, config: TuiConfig) -> Result<()> {
-    let llm = LlmClient::from_env(config.model.clone(), config.preamble);
+    let llm = LlmClient::from_env(
+        config.model.clone(),
+        config.preamble,
+        config.reasoning_effort,
+    );
     let history = memory
         .chat_history(&config.session)
         .context("failed to read chat history")?;
@@ -302,9 +307,10 @@ fn render_input(frame: &mut Frame, area: Rect, input: &str) {
 
 fn render_status(frame: &mut Frame, area: Rect, app: &App, config: &TuiConfig) {
     let status = format!(
-        "Rust | Rig workflow + OpenAI SDK | session: {} | model: {} | {}",
+        "Rust | Rig workflow + OpenAI SDK | session: {} | model: {} | reasoning: {} | {}",
         config.session,
         config.model,
+        reasoning_effort_label(config.reasoning_effort),
         status_text(app)
     );
     let status_box = Paragraph::new(status)
@@ -312,6 +318,12 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App, config: &TuiConfig) {
         .wrap(Wrap { trim: true });
 
     frame.render_widget(status_box, area);
+}
+
+fn reasoning_effort_label(reasoning_effort: Option<ReasoningEffort>) -> String {
+    reasoning_effort
+        .map(|reasoning_effort| reasoning_effort.to_string())
+        .unwrap_or_else(|| "unset".to_string())
 }
 
 fn status_text(app: &App) -> String {
