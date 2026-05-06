@@ -1199,7 +1199,7 @@ fn paste_text_from_clipboard() -> Result<String> {
 }
 
 fn push_pasted_text(input: &mut String, text: &str) {
-    input.push_str(&text.replace("\r\n", "\n").replace('\r', "\n"));
+    input.push_str(&text.replace("\r\n", " ").replace(['\r', '\n'], " "));
 }
 
 fn format_error_chain(error: &anyhow::Error) -> String {
@@ -1338,12 +1338,12 @@ mod tests {
     }
 
     #[test]
-    fn push_pasted_text_normalizes_line_endings() {
+    fn push_pasted_text_keeps_prompt_single_line() {
         let mut input = "hello ".to_string();
 
-        push_pasted_text(&mut input, "one\r\ntwo\rthree");
+        push_pasted_text(&mut input, "one\r\ntwo\rthree\nfour");
 
-        assert_eq!(input, "hello one\ntwo\nthree");
+        assert_eq!(input, "hello one two three four");
     }
 
     #[test]

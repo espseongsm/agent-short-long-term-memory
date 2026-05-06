@@ -8,7 +8,7 @@
 - 기본 모델 `Qwen/Qwen3.6-35B-A3B`를 사용하는 OpenAI 호환 모델 호출에 Rig 워크플로 메시지 구성을 연결했다.
 - 영어/한국어 입력, Markdown 대화 렌더링, 즉시 사용자 메시지 표시, 키보드/마우스 스크롤을 지원하는 Ratatui TUI를 구축했다.
 - 오래 걸리는 모델 응답 중 TUI 상태와 대화창 안 LLM 활동 보존을 추가하고, 날씨/웹 검색 도구와 요청 증폭 서브에이전트를 자동 라우팅과 CLI/TUI 명령에 연결했다.
-- `Ctrl+C`/`Ctrl+V` 캡처, TUI 내부 reasoning effort 제어, pgvector 기반 로컬 Markdown 장기 메모리 색인/검색을 추가하고 문서를 갱신했다.
+- `Ctrl+C`/`Ctrl+V` 캡처와 붙여넣기 줄바꿈 정리, TUI 내부 reasoning effort 제어, pgvector 기반 로컬 Markdown 장기 메모리 색인/검색을 추가하고 문서를 갱신했다.
 
 ### 검증
 
