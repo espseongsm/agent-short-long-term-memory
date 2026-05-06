@@ -32,6 +32,7 @@ Current scope:
 - Added mouse wheel scrolling for the TUI conversation pane.
 - Showed submitted TUI user messages immediately while the model response is still pending.
 - Added a single-file daily development progress report in `daily-progress-report.md`.
+- Added GitHub Actions CI for formatting, tests, clippy, Valkey integration tests, and CLI help smoke checks.
 - Kept CLI subcommands in `src/main.rs` for utility and scripting workflows.
 - Kept local sensitive variables in `.env`, and ensured `.env` is ignored by git.
 - Added Rig Core, Async OpenAI, Tokio, Serde, Serde JSON, Redis, Clap, Anyhow, Thiserror, Ratatui, Crossterm, and Dotenvy dependencies.
@@ -198,6 +199,10 @@ cargo run -- chat "hello" --reasoning-effort low
 ## Daily reports
 
 Development progress is saved in Korean in one Markdown file: `daily-progress-report.md`. Add each working day as a dated section with at most five concise bullet points.
+
+## CI
+
+GitHub Actions runs `cargo fmt --check`, `cargo test`, `cargo clippy -- -D warnings`, Valkey-backed ignored tests, and CLI/TUI help smoke checks on pushes to `main` and pull requests.
 
 ## Defaults
 
