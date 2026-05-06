@@ -1,6 +1,6 @@
 # Agent short and long term memory
 
-## Agent workflow
+## Multi-agent workflow
 
 - Use an OpenAI-compatible SDK for model calls.
 - Use Rig as a main framework for agent workflow such as overall process, prompts and agent communication
@@ -12,8 +12,12 @@
 - model is Qwen/Qwen3.6-35B-A3B by default.
 - user message shows up in the conversation pane as soon as a user typed in.
 - system prompt for agent is saved in prompt folder in a yaml format.
-- what llm does should be shown in tui because response often takes time. And the user will be bored.
-- control reasoning effort of llm for latency.
+- what llm does should be shown in tui because response often takes time. And the user will be bored. Please shows llm's actions in the middle of conversation between user and assistant. Keep the llm's action in the conversation pane.
+- control reasoning effort of llm for latency. It can be controlled in tui.
+- add current weather tool, which is automatically called for weather questions
+- add web search tool, which is automatically called
+- user request amplifier: this is an sub-agent that amplifies the user's request when the request is too simple to answer correctly, which is automatically called.
+- tui supports captures such as ctrl+c and ctrl+v
 
 ## Short term memory
 
@@ -25,7 +29,8 @@
 
 ## Long term memory
 
-- Long term memory storage and retrieval behavior is to be defined.
+- Long term memory is implemented using pg-vector.
+- data source is md files in this local machine.
 
 ## Development progress daily report
 

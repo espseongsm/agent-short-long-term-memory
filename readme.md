@@ -10,9 +10,12 @@ Current scope:
 - Save chat history in Valkey with user id, session id, timestamp, role, and content.
 - Save the agent system prompt as YAML in a local `prompt/` folder.
 - Control LLM reasoning effort for latency when the provider supports it.
+- Automatically fetch current weather from a dedicated weather API for weather requests.
+- Automatically search the web for current or explicitly web-backed requests.
+- Automatically amplify rough user requests when they are too vague to answer well.
+- Use pgvector as long term memory over local Markdown files.
 - Search saved chat history.
 - Keep daily development progress reports in Markdown.
-- Leave long term memory design open until storage and retrieval behavior is defined.
 
 ## What has been done
 
@@ -27,15 +30,20 @@ Current scope:
 - Added English/Korean Unicode input handling in the TUI prompt line.
 - Added TUI conversation scrolling for session history.
 - Added basic Markdown rendering for conversation messages.
-- Added live TUI status while model responses are pending.
+- Added live TUI status and kept in-conversation LLM activity lines for model responses.
+- Added an Open-Meteo-backed current weather tool with automatic chat enrichment and CLI access.
+- Added a DuckDuckGo-compatible web search tool with automatic chat enrichment plus CLI and TUI access.
+- Added a request amplifier sub-agent with automatic vague-request enrichment plus CLI and TUI access.
 - Added optional LLM reasoning effort control for latency-sensitive runs.
 - Added mouse wheel scrolling for the TUI conversation pane.
+- Added TUI clipboard capture for `Ctrl+C`, `Ctrl+V`, and bracketed paste.
 - Showed submitted TUI user messages immediately while the model response is still pending.
+- Added pgvector-backed long term memory indexing and search for local Markdown files.
 - Added a single-file daily development progress report in `daily-progress-report.md`.
 - Added GitHub Actions CI for formatting, tests, clippy, Valkey integration tests, and CLI help smoke checks.
 - Kept CLI subcommands in `src/main.rs` for utility and scripting workflows.
 - Kept local sensitive variables in `.env`, and ensured `.env` is ignored by git.
-- Added Rig Core, Async OpenAI, Tokio, Serde, Serde JSON, Redis, Clap, Anyhow, Thiserror, Ratatui, Crossterm, and Dotenvy dependencies.
+- Added Rig Core, Async OpenAI, Tokio, Serde, Serde JSON, Redis, Reqwest, Clap, Anyhow, Thiserror, Ratatui, Crossterm, Arboard, Tokio Postgres, and Dotenvy dependencies.
 - Started and verified a local Valkey Docker container named `valkey-memory`.
 
 ## Architecture
@@ -46,6 +54,11 @@ TUI
 |-- immediate user message display
 |-- prompt/system.yaml system prompt archive
 |-- optional reasoning effort control
+|-- kept in-conversation LLM activity lines
+|-- automatic current weather router plus weather CLI
+|-- automatic web search router plus /search command
+|-- automatic request amplifier router plus /amplify command
+|-- TUI clipboard capture for Ctrl+C, Ctrl+V, bracketed paste
  |
  v
 Rig workflow messages
@@ -61,6 +74,17 @@ Valkey chat history with user/session/timestamp metadata
  |
  |-- CLI history/search
  |-- CLI remember/recall/forget
+ |-- final answers enriched by automatic weather context
+ |-- manual CLI/TUI web search results
+ |-- manual CLI/TUI amplified requests
+ |-- final answers enriched by automatic web/amplifier context
+ |
+ v
+pgvector long term memory
+ |
+ |-- local Markdown indexing
+ |-- CLI long-term-index/search
+ |-- optional automatic chat context when PGVECTOR_URL is set
 ```
 
 ## Valkey
@@ -110,7 +134,7 @@ Start the terminal UI:
 cargo run
 ```
 
-The app automatically loads `.env` when it exists. It reads `OPENAI_API_KEY`, `BEARER_TOKEN`, `OPENAI_BASE_URL`, `OPENAI_API_BASE`, `OPENAI_MODEL`, `LLM_REASONING_EFFORT`, and `LLM_TIMEOUT_SECONDS` from the process environment, so exported or inline variables still work.
+The app automatically loads `.env` when it exists. It reads model, Valkey, weather, web-search, and pgvector settings from the process environment, so exported or inline variables still work.
 By default, each process gets a fresh generated user id and session id. Pass `--user-id` and `--session`, or set `AGENT_USER_ID`, when you want to continue a known history.
 
 Start the terminal UI with explicit options:
@@ -121,10 +145,17 @@ cargo run -- --user-id soonmo tui --session work --model Qwen/Qwen3.6-35B-A3B --
 
 The TUI loads recent chat history from Valkey, shapes the prompt flow as Rig workflow messages, sends the request through the OpenAI-compatible SDK, and stores the user and assistant messages back into Valkey.
 The TUI marks the status line as `Rust | Rig workflow + OpenAI SDK`.
-While a response is pending, the status line shows the model-call flow and elapsed wait time.
-Reasoning effort is optional and is not sent by default. Use `--reasoning-effort` or `LLM_REASONING_EFFORT` when the selected provider supports it. Supported values are `none`, `minimal`, `low`, `medium`, `high`, and `xhigh`.
+While a response is pending, the conversation pane shows an assistant activity line between the submitted user message and the final assistant response. The activity line is kept in the conversation pane after the response arrives, while Valkey stores only user and assistant chat messages. The status line also shows the model-call flow and elapsed wait time.
+Reasoning effort is optional and is not sent by default. Use `--reasoning-effort` or `LLM_REASONING_EFFORT` when the selected provider supports it. Inside the TUI, run `/reasoning <unset|none|minimal|low|medium|high|xhigh>` or `/effort <value>` to change the value for future model and amplifier calls in the current session.
 The conversation pane can be scrolled with Up/Down, PageUp/PageDown, Home, End, and the mouse wheel.
 Conversation messages are rendered with basic Markdown support for headings, lists, quotes, code, and emphasis.
+`Ctrl+C` copies the current prompt when the prompt line has text, and exits the TUI when the prompt line is empty. `Ctrl+V` and bracketed paste insert clipboard text into the prompt, preserving pasted newlines as spaces.
+Normal chat automatically fetches current weather from Open-Meteo for weather prompts such as `Seoul current weather` or `서울 현재 날씨`, then passes the weather report into the model as context.
+Normal chat automatically searches the web for current information requests such as latest/current/news/price prompts, then passes the result summary into the model as context.
+Normal chat automatically asks the request amplifier sub-agent to expand vague requests such as `make it better`, then asks the main model to answer the amplified request while preserving the original intent.
+When `PGVECTOR_URL` is set and Markdown has been indexed, normal chat also searches long term memory and passes the most relevant local Markdown chunks into the model as optional context.
+Run `/search <query>` or `/web <query>` in the TUI to force a standalone web search. Search requests and result summaries are saved as user/assistant messages; the web-search action line is display-only.
+Run `/amplify <request>` in the TUI to force a standalone request amplification. Amplification requests and results are saved as user/assistant messages; the amplifier action line is display-only.
 
 The agent system prompt is saved to `prompt/system.yaml`. Chat history is saved in Valkey, not in `prompt/`.
 
@@ -137,6 +168,12 @@ OPENAI_BASE_URL=...
 OPENAI_MODEL=Qwen/Qwen3.6-35B-A3B
 LLM_REASONING_EFFORT=low
 LLM_TIMEOUT_SECONDS=30
+WEB_SEARCH_URL=https://api.duckduckgo.com/
+WEB_SEARCH_TIMEOUT_SECONDS=10
+WEATHER_GEOCODING_URL=http://geocoding-api.open-meteo.com/v1/search
+WEATHER_FORECAST_URL=http://api.open-meteo.com/v1/forecast
+WEATHER_TIMEOUT_SECONDS=10
+PGVECTOR_URL=postgres://postgres:postgres@127.0.0.1:5432/agent_memory
 ```
 
 `BEARER_TOKEN` is also accepted as a fallback when `OPENAI_API_KEY` is not set.
@@ -156,6 +193,8 @@ Run one chat turn without opening the TUI:
 cargo run -- chat "hello"
 ```
 
+The `chat` command uses the same automatic weather, web-search, request-amplifier, and optional pgvector long term memory routing as the TUI. Automatic helper failures are reported to stderr and the main model continues with the best available prompt.
+
 Use a named chat session:
 
 ```sh
@@ -174,6 +213,39 @@ Search chat history:
 ```sh
 cargo run -- search hello
 cargo run -- search hello --session work
+```
+
+Search the web:
+
+```sh
+cargo run -- web-search "latest Rust release"
+cargo run -- web-search "Valkey Redis fork" --limit 3
+```
+
+Fetch current weather:
+
+```sh
+cargo run -- weather Seoul
+```
+
+Index local Markdown into pgvector long term memory:
+
+```sh
+PGVECTOR_URL=postgres://postgres:postgres@127.0.0.1:5432/agent_memory cargo run -- long-term-index ./notes
+```
+
+Search long term memory:
+
+```sh
+PGVECTOR_URL=postgres://postgres:postgres@127.0.0.1:5432/agent_memory cargo run -- long-term-search "Valkey setup" --limit 3
+```
+
+The pgvector schema is created automatically. The configured PostgreSQL role needs permission to run `CREATE EXTENSION IF NOT EXISTS vector`. Markdown chunks use deterministic local hashed embeddings, so indexing works without a separate embeddings API.
+
+Amplify a request:
+
+```sh
+cargo run -- amplify "make the tui better"
 ```
 
 Save, read, and delete a simple short term memory value:
@@ -196,6 +268,13 @@ Control reasoning effort for a latency-sensitive chat turn:
 cargo run -- chat "hello" --reasoning-effort low
 ```
 
+Control reasoning effort inside the TUI:
+
+```text
+/reasoning low
+/reasoning unset
+```
+
 ## Daily reports
 
 Development progress is saved in Korean in one Markdown file: `daily-progress-report.md`. Add each working day as a dated section with at most five concise bullet points.
@@ -214,6 +293,10 @@ GitHub Actions runs `cargo fmt --check`, `cargo test`, `cargo clippy -- -D warni
 - Chat TTL: `86400` seconds
 - OpenAI model: `Qwen/Qwen3.6-35B-A3B`
 - Reasoning effort: unset unless `--reasoning-effort` or `LLM_REASONING_EFFORT` is provided
+- Weather API: Open-Meteo geocoding and forecast endpoints
+- Web search URL: `https://api.duckduckgo.com/`
+- Web search limit: `5`
+- pgvector URL: unset by default; set `PGVECTOR_URL` to enable long term memory
 
 ## Verification
 
@@ -221,17 +304,19 @@ These checks passed:
 
 ```sh
 cargo fmt --check
-cargo test
-VALKEY_URL=redis://127.0.0.1:6379/ cargo test -- --ignored
-cargo clippy -- -D warnings
-cargo run -- --help
-cargo run -- tui --help
-cargo run -- chat --help
+CARGO_TARGET_DIR=target/prd-check cargo test
+CARGO_TARGET_DIR=target/prd-check cargo clippy -- -D warnings
+CARGO_TARGET_DIR=target/prd-check cargo run --quiet -- --help
+CARGO_TARGET_DIR=target/prd-check cargo run --quiet -- tui --help
+CARGO_TARGET_DIR=target/prd-check cargo run --quiet -- chat --help
+CARGO_TARGET_DIR=target/prd-check cargo run --quiet -- weather --help
+CARGO_TARGET_DIR=target/prd-check cargo run --quiet -- web-search --help
+CARGO_TARGET_DIR=target/prd-check cargo run --quiet -- long-term-index --help
+CARGO_TARGET_DIR=target/prd-check cargo run --quiet -- long-term-search --help
+CARGO_TARGET_DIR=target/prd-check cargo run --quiet -- amplify --help
+CARGO_TARGET_DIR=target/prd-check cargo run --quiet -- weather Seoul
+CARGO_TARGET_DIR=target/prd-check cargo run --quiet -- web-search "Rust programming language" --limit 2
 git diff --check
 ```
 
-Live TUI and `chat` model calls have not been verified in this session.
-
-## Current limitation
-
-Long term memory is only documented as a future requirement. The storage backend, retrieval strategy, and promotion rules from short term memory to long term memory still need to be defined.
+Live TUI, live pgvector indexing/search, and `chat` model calls require local services or provider credentials and have not been verified in this session.

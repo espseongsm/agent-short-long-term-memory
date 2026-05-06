@@ -3,13 +3,19 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::llm::{LlmClient, ReasoningEffort};
+use crate::{
+    agent_workflow,
+    llm::{LlmClient, ReasoningEffort},
+    long_term_memory,
+    weather::WeatherClient,
+    web_search::{DEFAULT_WEB_SEARCH_LIMIT, WebSearchClient},
+};
 use agent_memory::{ChatEntry, ChatRole, ShortTermMemory};
 use anyhow::{Context, Result};
 use crossterm::{
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
-        MouseEventKind,
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind,
     },
     execute,
 };
@@ -32,27 +38,46 @@ pub struct TuiConfig {
     pub history_limit: usize,
     pub ttl_seconds: u64,
     pub preamble: &'static str,
+    pub amplifier_preamble: &'static str,
+    pub pgvector_url: Option<String>,
 }
 
 struct App {
     entries: Vec<ChatEntry>,
+    actions: Vec<AgentAction>,
     input: String,
     status: String,
+    reasoning_effort: Option<ReasoningEffort>,
     conversation_scroll: usize,
     pending_response: Option<PendingResponse>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AgentAction {
+    after_entry_count: usize,
+    content: String,
 }
 
 struct PendingResponse {
     handle: JoinHandle<Result<String>>,
     started_at: Instant,
+    action_index: usize,
+}
+
+#[derive(Clone, Copy)]
+struct AgentServices<'a> {
+    weather: &'a WeatherClient,
+    web_search: &'a WebSearchClient,
 }
 
 impl App {
-    fn new(entries: Vec<ChatEntry>) -> Self {
+    fn new(entries: Vec<ChatEntry>, reasoning_effort: Option<ReasoningEffort>) -> Self {
         Self {
             entries,
+            actions: Vec::new(),
             input: String::new(),
             status: "ready".to_string(),
+            reasoning_effort,
             conversation_scroll: 0,
             pending_response: None,
         }
@@ -60,36 +85,43 @@ impl App {
 }
 
 pub async fn run(memory: &mut ShortTermMemory, config: TuiConfig) -> Result<()> {
-    let llm = LlmClient::from_env(
-        config.model.clone(),
-        config.preamble,
-        config.reasoning_effort,
-    );
+    let weather = WeatherClient::from_env().context("failed to init weather")?;
+    let web_search = WebSearchClient::from_env().context("failed to init web search")?;
     let history = memory
         .chat_history(&config.session)
         .context("failed to read chat history")?;
-    let mut app = App::new(history);
+    let mut app = App::new(history, config.reasoning_effort);
     let mut terminal = ratatui::init();
-    if let Err(error) =
-        execute!(io::stdout(), EnableMouseCapture).context("failed to enable mouse capture")
+    if let Err(error) = execute!(io::stdout(), EnableMouseCapture, EnableBracketedPaste)
+        .context("failed to enable terminal event capture")
     {
         ratatui::restore();
         return Err(error);
     }
 
-    let result = run_app(&mut terminal, memory, &llm, &config, &mut app).await;
-    let mouse_result =
-        execute!(io::stdout(), DisableMouseCapture).context("failed to disable mouse capture");
+    let result = run_app(
+        &mut terminal,
+        memory,
+        AgentServices {
+            weather: &weather,
+            web_search: &web_search,
+        },
+        &config,
+        &mut app,
+    )
+    .await;
+    let terminal_event_result = execute!(io::stdout(), DisableBracketedPaste, DisableMouseCapture)
+        .context("failed to disable terminal event capture");
     ratatui::restore();
 
-    mouse_result?;
+    terminal_event_result?;
     result
 }
 
 async fn run_app(
     terminal: &mut DefaultTerminal,
     memory: &mut ShortTermMemory,
-    llm: &LlmClient,
+    services: AgentServices<'_>,
     config: &TuiConfig,
     app: &mut App,
 ) -> Result<()> {
@@ -117,7 +149,28 @@ async fn run_app(
 
                 match key.code {
                     KeyCode::Esc => break,
-                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        if app.input.is_empty() {
+                            break;
+                        }
+
+                        if let Err(error) = copy_prompt_to_clipboard(&app.input) {
+                            app.status = format_error_chain(&error);
+                        } else {
+                            app.status = "clipboard: copied prompt".to_string();
+                        }
+                    }
+                    KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        match paste_text_from_clipboard() {
+                            Ok(text) => {
+                                push_pasted_text(&mut app.input, &text);
+                                app.status = "clipboard: pasted text".to_string();
+                            }
+                            Err(error) => {
+                                app.status = format_error_chain(&error);
+                            }
+                        }
+                    }
                     KeyCode::Up => scroll_conversation_up(app, 1),
                     KeyCode::Down => scroll_conversation_down(app, 1),
                     KeyCode::PageUp => scroll_conversation_up(app, 8),
@@ -136,6 +189,75 @@ async fn run_app(
 
                         let prompt = app.input.trim().to_string();
                         if prompt.is_empty() {
+                            continue;
+                        }
+
+                        if let Some(value) = reasoning_effort_command_value(&prompt) {
+                            if value.is_empty() {
+                                app.status =
+                                    "usage: /reasoning <unset|none|minimal|low|medium|high|xhigh>"
+                                        .to_string();
+                                continue;
+                            }
+
+                            match parse_reasoning_effort_command(value) {
+                                Ok(reasoning_effort) => {
+                                    app.reasoning_effort = reasoning_effort;
+                                    app.input.clear();
+                                    app.status = format!(
+                                        "reasoning effort: {}",
+                                        reasoning_effort_label(app.reasoning_effort)
+                                    );
+                                }
+                                Err(error) => app.status = format_error_chain(&error),
+                            }
+
+                            continue;
+                        }
+
+                        if let Some(query) = web_search_command_query(&prompt) {
+                            if query.is_empty() {
+                                app.status = "usage: /search <query>".to_string();
+                                continue;
+                            }
+
+                            let query = query.to_string();
+                            app.input.clear();
+
+                            if let Err(error) = submit_web_search(
+                                terminal,
+                                memory,
+                                services.web_search,
+                                config,
+                                app,
+                                prompt,
+                                &query,
+                            )
+                            .await
+                            {
+                                app.status = format_error_chain(&error);
+                            }
+
+                            continue;
+                        }
+
+                        if let Some(request) = amplify_command_request(&prompt) {
+                            if request.is_empty() {
+                                app.status = "usage: /amplify <request>".to_string();
+                                continue;
+                            }
+
+                            let request = request.to_string();
+                            app.input.clear();
+
+                            if let Err(error) = submit_request_amplification(
+                                terminal, memory, config, app, prompt, &request,
+                            )
+                            .await
+                            {
+                                app.status = format_error_chain(&error);
+                            }
+
                             continue;
                         }
 
@@ -161,11 +283,32 @@ async fn run_app(
                         app.status = "memory: saving user message to Valkey".to_string();
                         terminal.draw(|frame| render(frame, app, config))?;
 
-                        if let Err(error) =
-                            start_prompt_submission(memory, llm, config, app, history, user_entry)
+                        if let Err(error) = memory
+                            .append_chat_entry(
+                                &config.session,
+                                user_entry,
+                                config.history_limit,
+                                config.ttl_seconds,
+                            )
+                            .context("failed to save user chat history")
                         {
                             app.status = format_error_chain(&error);
+                            continue;
                         }
+
+                        let prompt_for_llm = match prepare_automatic_chat_prompt(
+                            terminal, services, config, app, &history, &prompt,
+                        )
+                        .await
+                        {
+                            Ok(prompt_for_llm) => prompt_for_llm,
+                            Err(error) => {
+                                app.status = format_error_chain(&error);
+                                continue;
+                            }
+                        };
+
+                        start_prompt_submission(config, app, history, prompt_for_llm);
                     }
                     _ => {}
                 }
@@ -175,6 +318,10 @@ async fn run_app(
                 MouseEventKind::ScrollDown => scroll_conversation_down(app, 3),
                 _ => {}
             },
+            Event::Paste(text) => {
+                push_pasted_text(&mut app.input, &text);
+                app.status = "clipboard: pasted text".to_string();
+            }
             _ => {}
         }
     }
@@ -186,15 +333,21 @@ async fn run_app(
     Ok(())
 }
 
-fn start_prompt_submission(
+async fn submit_web_search(
+    terminal: &mut DefaultTerminal,
     memory: &mut ShortTermMemory,
-    llm: &LlmClient,
+    web_search: &WebSearchClient,
     config: &TuiConfig,
     app: &mut App,
-    history: Vec<ChatEntry>,
-    user_entry: ChatEntry,
+    prompt: String,
+    query: &str,
 ) -> Result<()> {
-    let prompt = user_entry.content.clone();
+    let user_entry =
+        ChatEntry::for_session(&config.user_id, &config.session, ChatRole::User, &prompt);
+
+    show_local_entry(app, user_entry.clone(), config.history_limit);
+    app.status = "memory: saving web search request to Valkey".to_string();
+    terminal.draw(|frame| render(frame, app, config))?;
 
     memory
         .append_chat_entry(
@@ -203,18 +356,357 @@ fn start_prompt_submission(
             config.history_limit,
             config.ttl_seconds,
         )
-        .context("failed to save user chat history")?;
+        .context("failed to save web search request")?;
 
-    let llm = llm.clone();
+    let action_index = remember_agent_action(
+        app,
+        app.entries.len(),
+        "web search: querying DuckDuckGo-compatible endpoint",
+    );
+    app.status = format!("web search: searching `{query}`");
+    terminal.draw(|frame| render(frame, app, config))?;
+
+    let results = match web_search.search(query, DEFAULT_WEB_SEARCH_LIMIT).await {
+        Ok(results) => results,
+        Err(error) => {
+            set_agent_action(app, action_index, "web search: request failed".to_string());
+            return Err(error);
+        }
+    };
+
+    set_agent_action(
+        app,
+        action_index,
+        "web search: received results".to_string(),
+    );
+    let assistant_entry = ChatEntry::for_session(
+        &config.user_id,
+        &config.session,
+        ChatRole::Assistant,
+        results.to_markdown(),
+    );
+
+    memory
+        .append_chat_entry(
+            &config.session,
+            assistant_entry.clone(),
+            config.history_limit,
+            config.ttl_seconds,
+        )
+        .context("failed to save web search results")?;
+
+    show_local_entry(app, assistant_entry, config.history_limit);
+    app.status = "ready".to_string();
+
+    Ok(())
+}
+
+async fn submit_request_amplification(
+    terminal: &mut DefaultTerminal,
+    memory: &mut ShortTermMemory,
+    config: &TuiConfig,
+    app: &mut App,
+    prompt: String,
+    request: &str,
+) -> Result<()> {
+    let user_entry =
+        ChatEntry::for_session(&config.user_id, &config.session, ChatRole::User, &prompt);
+
+    show_local_entry(app, user_entry.clone(), config.history_limit);
+    app.status = "memory: saving amplification request to Valkey".to_string();
+    terminal.draw(|frame| render(frame, app, config))?;
+
+    memory
+        .append_chat_entry(
+            &config.session,
+            user_entry,
+            config.history_limit,
+            config.ttl_seconds,
+        )
+        .context("failed to save amplification request")?;
+
+    let action_index = remember_agent_action(
+        app,
+        app.entries.len(),
+        "request amplifier: expanding user request",
+    );
+    app.status = "request amplifier: waiting for sub-agent".to_string();
+    terminal.draw(|frame| render(frame, app, config))?;
+
+    let request_amplifier = LlmClient::from_env(
+        config.model.clone(),
+        config.amplifier_preamble,
+        app.reasoning_effort,
+    );
+    let amplified = match request_amplifier.chat(&[], request).await {
+        Ok(amplified) => amplified,
+        Err(error) => {
+            set_agent_action(
+                app,
+                action_index,
+                "request amplifier: request failed".to_string(),
+            );
+            return Err(error);
+        }
+    };
+
+    set_agent_action(
+        app,
+        action_index,
+        "request amplifier: produced amplified request".to_string(),
+    );
+    let assistant_entry = ChatEntry::for_session(
+        &config.user_id,
+        &config.session,
+        ChatRole::Assistant,
+        amplified,
+    );
+
+    memory
+        .append_chat_entry(
+            &config.session,
+            assistant_entry.clone(),
+            config.history_limit,
+            config.ttl_seconds,
+        )
+        .context("failed to save amplified request")?;
+
+    show_local_entry(app, assistant_entry, config.history_limit);
+    app.status = "ready".to_string();
+
+    Ok(())
+}
+
+fn start_prompt_submission(
+    config: &TuiConfig,
+    app: &mut App,
+    history: Vec<ChatEntry>,
+    prompt: String,
+) {
+    let llm = LlmClient::from_env(config.model.clone(), config.preamble, app.reasoning_effort);
+    let action_index = remember_agent_action(
+        app,
+        app.entries.len(),
+        "LLM: Rig workflow -> OpenAI-compatible request -> waiting for model",
+    );
     let handle = tokio::spawn(async move { llm.chat(&history, &prompt).await });
 
     app.pending_response = Some(PendingResponse {
         handle,
         started_at: Instant::now(),
+        action_index,
     });
     app.status = "LLM: Rig workflow -> OpenAI-compatible request -> waiting for model".to_string();
+}
 
-    Ok(())
+async fn prepare_automatic_chat_prompt(
+    terminal: &mut DefaultTerminal,
+    services: AgentServices<'_>,
+    config: &TuiConfig,
+    app: &mut App,
+    history: &[ChatEntry],
+    prompt: &str,
+) -> Result<String> {
+    let actions = agent_workflow::automatic_actions(prompt);
+    let mut prompt_for_llm = prompt.to_string();
+
+    if actions.amplify {
+        let action_index = remember_agent_action(
+            app,
+            app.entries.len(),
+            "request amplifier: automatically expanding vague request",
+        );
+        app.status = "request amplifier: automatically expanding vague request".to_string();
+        terminal.draw(|frame| render(frame, app, config))?;
+
+        let request_amplifier = LlmClient::from_env(
+            config.model.clone(),
+            config.amplifier_preamble,
+            app.reasoning_effort,
+        );
+        match request_amplifier.chat(history, prompt).await {
+            Ok(amplified) => {
+                set_agent_action(
+                    app,
+                    action_index,
+                    "request amplifier: produced automatic amplified request".to_string(),
+                );
+                prompt_for_llm = agent_workflow::prompt_with_amplification(prompt, &amplified);
+            }
+            Err(error) => {
+                set_agent_action(
+                    app,
+                    action_index,
+                    "request amplifier: automatic request failed; continuing with original request"
+                        .to_string(),
+                );
+                app.status = format_error_chain(&error);
+            }
+        }
+
+        terminal.draw(|frame| render(frame, app, config))?;
+    }
+
+    if actions.weather {
+        let location = agent_workflow::weather_location_query(prompt);
+        let action_index = remember_agent_action(
+            app,
+            app.entries.len(),
+            "weather: automatically fetching current conditions",
+        );
+        app.status = format!("weather: fetching current conditions for `{location}`");
+        terminal.draw(|frame| render(frame, app, config))?;
+
+        match services.weather.current_weather(&location).await {
+            Ok(report) => {
+                set_agent_action(
+                    app,
+                    action_index,
+                    "weather: added automatic current weather context".to_string(),
+                );
+                prompt_for_llm = agent_workflow::prompt_with_weather_context(
+                    &prompt_for_llm,
+                    &report.to_markdown(),
+                );
+            }
+            Err(error) => {
+                set_agent_action(
+                    app,
+                    action_index,
+                    "weather: automatic request failed; continuing without weather context"
+                        .to_string(),
+                );
+                app.status = format_error_chain(&error);
+            }
+        }
+
+        terminal.draw(|frame| render(frame, app, config))?;
+    }
+
+    if actions.web_search {
+        let action_index = remember_agent_action(
+            app,
+            app.entries.len(),
+            "web search: automatically searching for current context",
+        );
+        app.status = "web search: automatically searching for current context".to_string();
+        terminal.draw(|frame| render(frame, app, config))?;
+
+        match services
+            .web_search
+            .search(prompt, DEFAULT_WEB_SEARCH_LIMIT)
+            .await
+        {
+            Ok(results) => {
+                set_agent_action(
+                    app,
+                    action_index,
+                    "web search: added automatic web context".to_string(),
+                );
+                prompt_for_llm = agent_workflow::prompt_with_web_search_context(
+                    &prompt_for_llm,
+                    &results.to_markdown(),
+                );
+            }
+            Err(error) => {
+                set_agent_action(
+                    app,
+                    action_index,
+                    "web search: automatic request failed; continuing without web context"
+                        .to_string(),
+                );
+                app.status = format_error_chain(&error);
+            }
+        }
+
+        terminal.draw(|frame| render(frame, app, config))?;
+    }
+
+    if let Some(pgvector_url) = config.pgvector_url.as_deref() {
+        let action_index = remember_agent_action(
+            app,
+            app.entries.len(),
+            "long-term memory: searching local Markdown context",
+        );
+        app.status = "long-term memory: searching local Markdown context".to_string();
+        terminal.draw(|frame| render(frame, app, config))?;
+
+        match long_term_memory::connect(pgvector_url).await {
+            Ok(long_term) => match long_term.search(prompt, 3).await {
+                Ok(results) if !results.is_empty() => {
+                    set_agent_action(
+                        app,
+                        action_index,
+                        "long-term memory: added local Markdown context".to_string(),
+                    );
+                    prompt_for_llm = agent_workflow::prompt_with_long_term_context(
+                        &prompt_for_llm,
+                        &long_term_memory::LongTermSearchResult::to_markdown(&results),
+                    );
+                }
+                Ok(_) => {
+                    set_agent_action(
+                        app,
+                        action_index,
+                        "long-term memory: no relevant local Markdown context found".to_string(),
+                    );
+                }
+                Err(error) => {
+                    set_agent_action(
+                        app,
+                        action_index,
+                        "long-term memory: search failed; continuing without local context"
+                            .to_string(),
+                    );
+                    app.status = format_error_chain(&error);
+                }
+            },
+            Err(error) => {
+                set_agent_action(
+                    app,
+                    action_index,
+                    "long-term memory: connection failed; continuing without local context"
+                        .to_string(),
+                );
+                app.status = format_error_chain(&error);
+            }
+        }
+
+        terminal.draw(|frame| render(frame, app, config))?;
+    }
+
+    Ok(prompt_for_llm)
+}
+
+fn web_search_command_query(input: &str) -> Option<&str> {
+    let input = input.trim();
+
+    input
+        .strip_prefix("/search")
+        .or_else(|| input.strip_prefix("/web"))
+        .map(str::trim)
+}
+
+fn amplify_command_request(input: &str) -> Option<&str> {
+    input.trim().strip_prefix("/amplify").map(str::trim)
+}
+
+fn reasoning_effort_command_value(input: &str) -> Option<&str> {
+    input
+        .trim()
+        .strip_prefix("/reasoning")
+        .or_else(|| input.trim().strip_prefix("/effort"))
+        .map(str::trim)
+}
+
+fn parse_reasoning_effort_command(value: &str) -> Result<Option<ReasoningEffort>> {
+    let value = value.trim();
+
+    if value.eq_ignore_ascii_case("unset") || value.eq_ignore_ascii_case("default") {
+        return Ok(None);
+    }
+
+    ReasoningEffort::from_env_value(Some(value))
 }
 
 async fn finish_pending_response(
@@ -226,37 +718,61 @@ async fn finish_pending_response(
         .pending_response
         .take()
         .context("no pending model response to finish")?;
+    let PendingResponse {
+        handle,
+        started_at,
+        action_index,
+    } = pending_response;
     app.status = "memory: saving assistant response to Valkey".to_string();
 
-    let response = pending_response
-        .handle
+    let response = match handle
         .await
         .context("model response task failed")?
-        .context("failed to run agent chat")?;
+        .context("failed to run agent chat")
+    {
+        Ok(response) => response,
+        Err(error) => {
+            set_agent_action(
+                app,
+                action_index,
+                format!(
+                    "LLM: model request failed | {}s elapsed",
+                    started_at.elapsed().as_secs()
+                ),
+            );
+            return Err(error);
+        }
+    };
+
+    set_agent_action(
+        app,
+        action_index,
+        format!(
+            "LLM: Rig workflow -> OpenAI-compatible request -> received model response | {}s elapsed",
+            started_at.elapsed().as_secs()
+        ),
+    );
+
     let assistant_entry = ChatEntry::for_session(
         &config.user_id,
         &config.session,
         ChatRole::Assistant,
-        response,
+        &response,
     );
 
     memory
         .append_chat_entry(
             &config.session,
-            assistant_entry,
+            assistant_entry.clone(),
             config.history_limit,
             config.ttl_seconds,
         )
         .context("failed to save assistant chat history")?;
 
-    memory
-        .chat_history(&config.session)
-        .context("failed to read updated chat history")
-        .map(|entries| {
-            app.entries = entries;
-            scroll_conversation_to_bottom(app);
-            app.status = "ready".to_string();
-        })
+    show_local_entry(app, assistant_entry, config.history_limit);
+    app.status = "ready".to_string();
+
+    Ok(())
 }
 
 fn render(frame: &mut Frame, app: &App, config: &TuiConfig) {
@@ -267,25 +783,16 @@ fn render(frame: &mut Frame, app: &App, config: &TuiConfig) {
     ])
     .areas(frame.area());
 
-    render_conversation(
-        frame,
-        conversation_area,
-        &app.entries,
-        app.conversation_scroll,
-    );
+    render_conversation(frame, conversation_area, app);
     render_input(frame, input_area, &app.input);
     render_status(frame, status_area, app, config);
 }
 
-fn render_conversation(
-    frame: &mut Frame,
-    area: Rect,
-    entries: &[ChatEntry],
-    scroll_from_bottom: usize,
-) {
-    let lines = conversation_lines(entries);
+fn render_conversation(frame: &mut Frame, area: Rect, app: &App) {
+    let actions = visible_actions(app);
+    let lines = conversation_lines(&app.entries, &actions);
     let visible_rows = area.height.saturating_sub(2) as usize;
-    let scroll = conversation_scroll(lines.len(), visible_rows, scroll_from_bottom);
+    let scroll = conversation_scroll(lines.len(), visible_rows, app.conversation_scroll);
     let conversation = Paragraph::new(lines)
         .block(Block::bordered().title("Conversation"))
         .wrap(Wrap { trim: false })
@@ -310,7 +817,7 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App, config: &TuiConfig) {
         "Rust | Rig workflow + OpenAI SDK | session: {} | model: {} | reasoning: {} | {}",
         config.session,
         config.model,
-        reasoning_effort_label(config.reasoning_effort),
+        reasoning_effort_label(app.reasoning_effort),
         status_text(app)
     );
     let status_box = Paragraph::new(status)
@@ -349,14 +856,41 @@ fn pending_spinner(elapsed: Duration) -> &'static str {
     }
 }
 
-fn conversation_lines(entries: &[ChatEntry]) -> Vec<Line<'static>> {
-    if entries.is_empty() {
+fn pending_conversation_text(app: &App) -> Option<String> {
+    let pending_response = app.pending_response.as_ref()?;
+    let elapsed = pending_response.started_at.elapsed();
+    let spinner = pending_spinner(elapsed);
+
+    Some(format!(
+        "{spinner} {} | {}s elapsed",
+        app.status,
+        elapsed.as_secs()
+    ))
+}
+
+fn visible_actions(app: &App) -> Vec<AgentAction> {
+    let mut actions = app.actions.clone();
+
+    if let Some(pending_response) = &app.pending_response
+        && let Some(action) = actions.get_mut(pending_response.action_index)
+        && let Some(content) = pending_conversation_text(app)
+    {
+        action.content = content;
+    }
+
+    actions
+}
+
+fn conversation_lines(entries: &[ChatEntry], actions: &[AgentAction]) -> Vec<Line<'static>> {
+    if entries.is_empty() && actions.is_empty() {
         return vec![Line::from("No chat history yet.")];
     }
 
-    entries
-        .iter()
-        .flat_map(|entry| {
+    let mut lines = Vec::new();
+    push_action_lines(&mut lines, actions, 0);
+
+    for (index, entry) in entries.iter().enumerate() {
+        lines.extend({
             let color = match entry.role {
                 ChatRole::User => Color::Cyan,
                 ChatRole::Assistant => Color::Green,
@@ -383,8 +917,34 @@ fn conversation_lines(entries: &[ChatEntry]) -> Vec<Line<'static>> {
             }
 
             rendered
-        })
-        .collect()
+        });
+        push_action_lines(&mut lines, actions, index + 1);
+    }
+
+    lines
+}
+
+fn push_action_lines(
+    lines: &mut Vec<Line<'static>>,
+    actions: &[AgentAction],
+    after_entry_count: usize,
+) {
+    lines.extend(
+        actions
+            .iter()
+            .filter(|action| action.after_entry_count == after_entry_count)
+            .map(|action| action_line(&action.content)),
+    );
+}
+
+fn action_line(action: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            "assistant: ",
+            Style::new().fg(Color::Green).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(action.to_string(), Style::new().fg(Color::Yellow)),
+    ])
 }
 
 fn markdown_lines(markdown: &str) -> Vec<Line<'static>> {
@@ -585,15 +1145,61 @@ fn scroll_conversation_to_bottom(app: &mut App) {
 
 fn show_local_entry(app: &mut App, entry: ChatEntry, max_entries: usize) {
     app.entries.push(entry);
-    trim_visible_entries(&mut app.entries, max_entries);
+    let removed_entries = trim_visible_entries(&mut app.entries, max_entries);
+    trim_actions_after_entry_removal(&mut app.actions, removed_entries);
     scroll_conversation_to_bottom(app);
 }
 
-fn trim_visible_entries(entries: &mut Vec<ChatEntry>, max_entries: usize) {
+fn trim_visible_entries(entries: &mut Vec<ChatEntry>, max_entries: usize) -> usize {
     let extra_entries = entries.len().saturating_sub(max_entries);
     if extra_entries > 0 {
         entries.drain(0..extra_entries);
     }
+
+    extra_entries
+}
+
+fn trim_actions_after_entry_removal(actions: &mut Vec<AgentAction>, removed_entries: usize) {
+    if removed_entries == 0 {
+        return;
+    }
+
+    for action in actions.iter_mut() {
+        action.after_entry_count = action.after_entry_count.saturating_sub(removed_entries);
+    }
+    actions.retain(|action| action.after_entry_count > 0);
+}
+
+fn remember_agent_action(app: &mut App, after_entry_count: usize, content: &str) -> usize {
+    app.actions.push(AgentAction {
+        after_entry_count,
+        content: content.to_string(),
+    });
+    app.actions.len() - 1
+}
+
+fn set_agent_action(app: &mut App, action_index: usize, content: String) {
+    if let Some(action) = app.actions.get_mut(action_index) {
+        action.content = content;
+    }
+}
+
+fn copy_prompt_to_clipboard(input: &str) -> Result<()> {
+    let mut clipboard = arboard::Clipboard::new().context("failed to open clipboard")?;
+    clipboard
+        .set_text(input.to_string())
+        .context("failed to copy prompt to clipboard")
+}
+
+fn paste_text_from_clipboard() -> Result<String> {
+    let mut clipboard = arboard::Clipboard::new().context("failed to open clipboard")?;
+    clipboard
+        .get_text()
+        .context("failed to read text from clipboard")
+}
+
+fn push_pasted_text(input: &mut String, text: &str) {
+    input.push_str(&text.replace("\r\n", "\n").replace('\r', "\n"));
 }
 
 fn format_error_chain(error: &anyhow::Error) -> String {
@@ -650,6 +1256,48 @@ mod tests {
     }
 
     #[test]
+    fn parses_web_search_commands() {
+        assert_eq!(
+            web_search_command_query("/search rust tui"),
+            Some("rust tui")
+        );
+        assert_eq!(web_search_command_query("/web valkey"), Some("valkey"));
+        assert_eq!(web_search_command_query("hello"), None);
+    }
+
+    #[test]
+    fn parses_amplify_commands() {
+        assert_eq!(
+            amplify_command_request("/amplify build a tui"),
+            Some("build a tui")
+        );
+        assert_eq!(amplify_command_request("build a tui"), None);
+    }
+
+    #[test]
+    fn parses_reasoning_effort_commands() {
+        assert_eq!(
+            reasoning_effort_command_value("/reasoning low"),
+            Some("low")
+        );
+        assert_eq!(
+            reasoning_effort_command_value("/effort unset"),
+            Some("unset")
+        );
+        assert_eq!(reasoning_effort_command_value("hello"), None);
+    }
+
+    #[test]
+    fn parses_reasoning_effort_command_values() {
+        assert_eq!(
+            parse_reasoning_effort_command("low").unwrap(),
+            Some(ReasoningEffort::Low)
+        );
+        assert_eq!(parse_reasoning_effort_command("unset").unwrap(), None);
+        assert!(parse_reasoning_effort_command("fast").is_err());
+    }
+
+    #[test]
     fn markdown_lines_renders_markdown_blocks() {
         let lines = markdown_lines("# Title\n\n- one\n- **two**");
 
@@ -663,6 +1311,26 @@ mod tests {
     }
 
     #[test]
+    fn conversation_lines_keep_agent_action_between_user_and_assistant() {
+        let entries = vec![
+            ChatEntry::new(ChatRole::User, "hello"),
+            ChatEntry::new(ChatRole::Assistant, "hi"),
+        ];
+        let actions = vec![AgentAction {
+            after_entry_count: 1,
+            content: "LLM: received model response".to_string(),
+        }];
+
+        let lines = conversation_lines(&entries, &actions);
+
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0].spans[0].content, "user: ");
+        assert_eq!(lines[1].spans[0].content, "assistant: ");
+        assert_eq!(lines[1].spans[1].content, "LLM: received model response");
+        assert_eq!(lines[2].spans[0].content, "assistant: ");
+    }
+
+    #[test]
     fn error_chain_includes_causes() {
         let error = anyhow::anyhow!("root").context("outer");
 
@@ -670,8 +1338,17 @@ mod tests {
     }
 
     #[test]
+    fn push_pasted_text_normalizes_line_endings() {
+        let mut input = "hello ".to_string();
+
+        push_pasted_text(&mut input, "one\r\ntwo\rthree");
+
+        assert_eq!(input, "hello one\ntwo\nthree");
+    }
+
+    #[test]
     fn show_local_entry_adds_user_message_before_response() {
-        let mut app = App::new(Vec::new());
+        let mut app = App::new(Vec::new(), None);
         let entry = ChatEntry::with_metadata("soonmo", "default", 1, ChatRole::User, "hello");
 
         show_local_entry(&mut app, entry.clone(), 20);
@@ -681,10 +1358,13 @@ mod tests {
 
     #[test]
     fn show_local_entry_respects_history_limit() {
-        let mut app = App::new(vec![
-            ChatEntry::new(ChatRole::User, "one"),
-            ChatEntry::new(ChatRole::Assistant, "two"),
-        ]);
+        let mut app = App::new(
+            vec![
+                ChatEntry::new(ChatRole::User, "one"),
+                ChatEntry::new(ChatRole::Assistant, "two"),
+            ],
+            None,
+        );
 
         show_local_entry(&mut app, ChatEntry::new(ChatRole::User, "three"), 2);
 
@@ -694,6 +1374,44 @@ mod tests {
                 ChatEntry::new(ChatRole::Assistant, "two"),
                 ChatEntry::new(ChatRole::User, "three"),
             ]
+        );
+    }
+
+    #[test]
+    fn show_local_entry_drops_actions_for_trimmed_entries() {
+        let mut app = App::new(
+            vec![
+                ChatEntry::new(ChatRole::User, "one"),
+                ChatEntry::new(ChatRole::Assistant, "two"),
+            ],
+            None,
+        );
+        remember_agent_action(&mut app, 1, "LLM: old action");
+
+        show_local_entry(&mut app, ChatEntry::new(ChatRole::User, "three"), 2);
+
+        assert!(app.actions.is_empty());
+    }
+
+    #[test]
+    fn show_local_entry_shifts_actions_after_trimmed_entries() {
+        let mut app = App::new(
+            vec![
+                ChatEntry::new(ChatRole::User, "one"),
+                ChatEntry::new(ChatRole::Assistant, "two"),
+            ],
+            None,
+        );
+        remember_agent_action(&mut app, 2, "LLM: kept action");
+
+        show_local_entry(&mut app, ChatEntry::new(ChatRole::User, "three"), 2);
+
+        assert_eq!(
+            app.actions,
+            vec![AgentAction {
+                after_entry_count: 1,
+                content: "LLM: kept action".to_string(),
+            }]
         );
     }
 }

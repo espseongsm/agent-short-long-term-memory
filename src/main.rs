@@ -1,4 +1,5 @@
 use std::{
+    path::PathBuf,
     process,
     sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
@@ -10,8 +11,12 @@ use agent_memory::{
 use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand};
 
+mod agent_workflow;
 mod llm;
+mod long_term_memory;
 mod tui;
+mod weather;
+mod web_search;
 
 const DEFAULT_VALKEY_URL: &str = "redis://127.0.0.1:6379/";
 const DEFAULT_NAMESPACE: &str = "agent:short-term";
@@ -20,6 +25,7 @@ const DEFAULT_CHAT_TTL_SECONDS: u64 = 86_400;
 const DEFAULT_OPENAI_MODEL: &str = "Qwen/Qwen3.6-35B-A3B";
 const AGENT_PREAMBLE: &str =
     "You are a concise helpful assistant. Use the conversation history when it helps.";
+const REQUEST_AMPLIFIER_PREAMBLE: &str = "You are a user request amplifier sub-agent. Rewrite the user's request into a clearer, more complete, implementation-ready request. Preserve the user's intent, surface assumptions, and avoid adding unrelated requirements.";
 static RUNTIME_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Parser)]
@@ -33,6 +39,9 @@ struct Cli {
 
     #[arg(long, env = "AGENT_USER_ID")]
     user_id: Option<String>,
+
+    #[arg(long, env = "PGVECTOR_URL")]
+    pgvector_url: Option<String>,
 
     #[command(subcommand)]
     command: Option<Command>,
@@ -94,6 +103,36 @@ enum Command {
         #[arg(long)]
         session: Option<String>,
     },
+    WebSearch {
+        query: String,
+
+        #[arg(long, default_value_t = web_search::DEFAULT_WEB_SEARCH_LIMIT)]
+        limit: usize,
+    },
+    Weather {
+        location: String,
+    },
+    LongTermIndex {
+        path: PathBuf,
+
+        #[arg(long, default_value_t = long_term_memory::default_chunk_chars())]
+        chunk_chars: usize,
+    },
+    LongTermSearch {
+        query: String,
+
+        #[arg(long, default_value_t = 5)]
+        limit: usize,
+    },
+    Amplify {
+        request: String,
+
+        #[arg(long, env = "OPENAI_MODEL", default_value = DEFAULT_OPENAI_MODEL)]
+        model: String,
+
+        #[arg(long, env = "LLM_REASONING_EFFORT", value_enum)]
+        reasoning_effort: Option<llm::ReasoningEffort>,
+    },
     Forget {
         key: String,
     },
@@ -130,7 +169,81 @@ async fn main() -> Result<()> {
         Command::Remember { ttl_seconds, .. } => {
             ensure!(*ttl_seconds > 0, "ttl_seconds must be greater than zero");
         }
+        Command::WebSearch { limit, .. } => {
+            ensure!(*limit > 0, "limit must be greater than zero");
+        }
+        Command::LongTermIndex { chunk_chars, .. } => {
+            ensure!(*chunk_chars > 0, "chunk_chars must be greater than zero");
+        }
+        Command::LongTermSearch { limit, .. } => {
+            ensure!(*limit > 0, "limit must be greater than zero");
+        }
         _ => {}
+    }
+
+    if let Command::WebSearch { query, limit } = &command {
+        let web_search =
+            web_search::WebSearchClient::from_env().context("failed to init web search")?;
+        let results = web_search
+            .search(query, *limit)
+            .await
+            .context("failed to run web search")?;
+
+        println!("{}", results.to_markdown());
+        return Ok(());
+    }
+
+    if let Command::Weather { location } = &command {
+        let weather = weather::WeatherClient::from_env().context("failed to init weather")?;
+        let report = weather
+            .current_weather(location)
+            .await
+            .context("failed to fetch weather")?;
+
+        println!("{}", report.to_markdown());
+        return Ok(());
+    }
+
+    if let Command::LongTermIndex { path, chunk_chars } = &command {
+        let long_term = connect_long_term_memory(cli.pgvector_url.as_deref()).await?;
+        let indexed = long_term
+            .index_markdown_path(path, *chunk_chars)
+            .await
+            .with_context(|| format!("failed to index markdown from {}", path.display()))?;
+
+        println!("indexed {indexed} markdown chunks");
+        return Ok(());
+    }
+
+    if let Command::LongTermSearch { query, limit } = &command {
+        let long_term = connect_long_term_memory(cli.pgvector_url.as_deref()).await?;
+        let results = long_term
+            .search(query, *limit)
+            .await
+            .context("failed to search long-term memory")?;
+
+        println!(
+            "{}",
+            long_term_memory::LongTermSearchResult::to_markdown(&results)
+        );
+        return Ok(());
+    }
+
+    if let Command::Amplify {
+        request,
+        model,
+        reasoning_effort,
+    } = &command
+    {
+        let amplifier =
+            llm::LlmClient::from_env(model.clone(), REQUEST_AMPLIFIER_PREAMBLE, *reasoning_effort);
+        let amplified = amplifier
+            .chat(&[], request)
+            .await
+            .context("failed to amplify user request")?;
+
+        println!("{amplified}");
+        return Ok(());
     }
 
     let mut memory = ShortTermMemory::connect(&cli.valkey_url, &cli.namespace)
@@ -157,6 +270,8 @@ async fn main() -> Result<()> {
                     history_limit,
                     ttl_seconds,
                     preamble: AGENT_PREAMBLE,
+                    amplifier_preamble: REQUEST_AMPLIFIER_PREAMBLE,
+                    pgvector_url: cli.pgvector_url,
                 },
             )
             .await?;
@@ -177,9 +292,17 @@ async fn main() -> Result<()> {
                 .context("failed to save system prompt YAML")?;
             let user_entry = ChatEntry::for_session(&user_id, &session, ChatRole::User, prompt);
 
+            let prompt_for_llm = automatic_chat_prompt(
+                cli.pgvector_url.as_deref(),
+                &history,
+                &user_entry.content,
+                &model,
+                reasoning_effort,
+            )
+            .await;
             let llm = llm::LlmClient::from_env(model, AGENT_PREAMBLE, reasoning_effort);
             let response = llm
-                .chat(&history, user_entry.content.as_str())
+                .chat(&history, &prompt_for_llm)
                 .await
                 .context("failed to run agent chat")?;
 
@@ -228,6 +351,15 @@ async fn main() -> Result<()> {
                 .context("failed to search chat history")?;
             print_chat_entries(matches);
         }
+        Command::WebSearch { .. } => unreachable!("web search is handled before Valkey connects"),
+        Command::Weather { .. } => unreachable!("weather is handled before Valkey connects"),
+        Command::LongTermIndex { .. } => {
+            unreachable!("long-term indexing is handled before Valkey connects")
+        }
+        Command::LongTermSearch { .. } => {
+            unreachable!("long-term search is handled before Valkey connects")
+        }
+        Command::Amplify { .. } => unreachable!("amplify is handled before Valkey connects"),
         Command::Forget { key } => {
             let removed = memory
                 .forget(&key)
@@ -257,6 +389,119 @@ fn default_tui_command_from_values(
         history_limit: DEFAULT_HISTORY_LIMIT,
         ttl_seconds: DEFAULT_CHAT_TTL_SECONDS,
     })
+}
+
+async fn automatic_chat_prompt(
+    pgvector_url: Option<&str>,
+    history: &[ChatEntry],
+    prompt: &str,
+    model: &str,
+    reasoning_effort: Option<llm::ReasoningEffort>,
+) -> String {
+    let actions = agent_workflow::automatic_actions(prompt);
+    let mut prompt_for_llm = prompt.to_string();
+
+    if actions.amplify {
+        eprintln!("auto request amplifier: expanding vague request");
+        let amplifier = llm::LlmClient::from_env(
+            model.to_string(),
+            REQUEST_AMPLIFIER_PREAMBLE,
+            reasoning_effort,
+        );
+
+        match amplifier.chat(history, prompt).await {
+            Ok(amplified) => {
+                eprintln!("auto request amplifier: produced amplified request");
+                prompt_for_llm = agent_workflow::prompt_with_amplification(prompt, &amplified);
+            }
+            Err(error) => eprintln!("auto request amplifier failed: {error:#}"),
+        }
+    }
+
+    if actions.weather {
+        let location = agent_workflow::weather_location_query(prompt);
+        eprintln!("auto weather: fetching current weather for `{location}`");
+
+        match weather::WeatherClient::from_env() {
+            Ok(weather) => match weather.current_weather(&location).await {
+                Ok(report) => {
+                    eprintln!("auto weather: received current weather");
+                    prompt_for_llm = agent_workflow::prompt_with_weather_context(
+                        &prompt_for_llm,
+                        &report.to_markdown(),
+                    );
+                }
+                Err(error) => eprintln!("auto weather failed: {error:#}"),
+            },
+            Err(error) => eprintln!("auto weather init failed: {error:#}"),
+        }
+    }
+
+    if actions.web_search {
+        eprintln!("auto web search: searching for current context");
+        match web_search::WebSearchClient::from_env() {
+            Ok(web_search) => {
+                match web_search
+                    .search(prompt, web_search::DEFAULT_WEB_SEARCH_LIMIT)
+                    .await
+                {
+                    Ok(results) => {
+                        eprintln!("auto web search: received results");
+                        prompt_for_llm = agent_workflow::prompt_with_web_search_context(
+                            &prompt_for_llm,
+                            &results.to_markdown(),
+                        );
+                    }
+                    Err(error) => eprintln!("auto web search failed: {error:#}"),
+                }
+            }
+            Err(error) => eprintln!("auto web search init failed: {error:#}"),
+        }
+    }
+
+    if let Some(long_term_context) = automatic_long_term_context(pgvector_url, prompt).await {
+        prompt_for_llm =
+            agent_workflow::prompt_with_long_term_context(&prompt_for_llm, &long_term_context);
+    }
+
+    prompt_for_llm
+}
+
+async fn automatic_long_term_context(pgvector_url: Option<&str>, prompt: &str) -> Option<String> {
+    let pgvector_url = pgvector_url?;
+
+    eprintln!("auto long-term memory: searching local markdown context");
+    let long_term = match long_term_memory::connect(pgvector_url).await {
+        Ok(long_term) => long_term,
+        Err(error) => {
+            eprintln!("auto long-term memory init failed: {error:#}");
+            return None;
+        }
+    };
+    let results = match long_term.search(prompt, 3).await {
+        Ok(results) => results,
+        Err(error) => {
+            eprintln!("auto long-term memory search failed: {error:#}");
+            return None;
+        }
+    };
+
+    if results.is_empty() {
+        return None;
+    }
+
+    eprintln!("auto long-term memory: found context");
+    Some(long_term_memory::LongTermSearchResult::to_markdown(
+        &results,
+    ))
+}
+
+async fn connect_long_term_memory(
+    pgvector_url: Option<&str>,
+) -> Result<long_term_memory::LongTermMemory> {
+    let pgvector_url = pgvector_url.context("PGVECTOR_URL must be set for long-term memory")?;
+
+    long_term_memory::connect(pgvector_url).await
 }
 
 fn print_chat_entries(entries: Vec<ChatEntry>) {
