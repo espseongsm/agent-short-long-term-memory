@@ -8,11 +8,12 @@ Current scope:
 - Use a TUI as the agent interface.
 - Use Valkey as Redis-compatible short term memory.
 - Save chat history in Valkey with user id, session id, timestamp, role, and content.
-- Save the agent system prompt as YAML in a local `prompt/` folder.
+- Keep agent and sub-agent prompts as files in the local `prompt/` folder.
 - Control LLM reasoning effort for latency when the provider supports it.
 - Automatically fetch current weather from a dedicated weather API for weather requests.
 - Automatically search the web through a full Brave Search API integration for current or explicitly web-backed requests.
 - Automatically amplify rough user requests when they are too vague to answer well.
+- Automatically summarize saved chat sessions through a dedicated summary sub-agent when the user asks for a recap.
 - Use pgvector as long term memory over local Markdown files.
 - Search saved chat history.
 - Keep daily development progress reports in Markdown.
@@ -24,26 +25,29 @@ Current scope:
 - Added Valkey-backed short term memory in `src/lib.rs`.
 - Added structured chat history entries with user id, session id, timestamp, and `user` or `assistant` roles.
 - Added generated runtime user ids and session ids for default runs.
-- Added local YAML archiving for the system prompt in `prompt/`.
+- Added file-backed prompts in `prompt/` and local YAML archiving for the main system prompt.
 - Added conversion from saved chat entries into Rig workflow messages.
 - Added case-insensitive chat history search.
 - Added a Ratatui-based terminal UI in `src/tui.rs`.
 - Added English/Korean Unicode input handling in the TUI prompt line.
 - Added TUI conversation scrolling for session history.
 - Added basic Markdown rendering for conversation messages.
-- Added live TUI status and kept in-conversation LLM activity lines for model responses.
-- Added an Open-Meteo-backed current weather tool with automatic chat enrichment and CLI access.
+- Added live TUI status and kept in-conversation LLM activity lines with two-decimal elapsed time for model responses.
+- Added TUI session token usage display from Rig model responses.
+- Added an Open-Meteo-backed current weather tool with automatic chat enrichment, CLI access, Korean aliases, and an LLM location-name fallback for non-English places.
 - Added a Brave Search API-backed web search tool with automatic chat enrichment plus CLI and TUI access.
 - Added a request amplifier sub-agent with automatic vague-request enrichment plus CLI and TUI access.
+- Added a conversation summary sub-agent with automatic routing plus CLI and TUI access.
 - Added optional LLM reasoning effort control for latency-sensitive runs.
 - Added mouse wheel scrolling for the TUI conversation pane.
-- Added TUI clipboard capture for `Ctrl+C`, `Ctrl+V`, and bracketed paste.
+- Added TUI clipboard capture for `Ctrl+C`, `Ctrl+V`, bracketed paste, and mouse-drag conversation selection.
 - Showed submitted TUI user messages immediately while the model response is still pending.
 - Added pgvector-backed long term memory indexing and search for local Markdown files.
 - Added a single-file daily development progress report in `daily-progress-report.md`.
 - Added GitHub Actions CI for formatting, tests, clippy, Valkey integration tests, and CLI help smoke checks.
 - Kept CLI subcommands in `src/main.rs` for utility and scripting workflows.
 - Moved automatic chat prompt enrichment into `src/agent_workflow.rs` so `src/main.rs` stays focused on CLI dispatch.
+- Split long source files into focused `cli`, `agent_workflow`, and `tui` modules while preserving the public CLI/TUI behavior.
 - Kept local sensitive variables in `.env`, and ensured `.env` is ignored by git.
 - Added Rig Core, Tokio, Serde, Serde JSON, Redis, Reqwest, Clap, Anyhow, Thiserror, Ratatui, Crossterm, Arboard, Tokio Postgres, and Dotenvy dependencies.
 - Started and verified a local Valkey Docker container named `valkey-memory`.
@@ -51,14 +55,18 @@ Current scope:
 ## Code layout
 
 ```text
-src/main.rs              CLI entry point and command dispatch
-src/tui.rs               Ratatui interface, input handling, and live status rendering
-src/agent_workflow.rs    Automatic routing, prompt enrichment, and workflow helpers
+src/main.rs              CLI command dispatch and service wiring
+src/cli.rs               CLI definitions, defaults, and runtime ids
+src/tui.rs               TUI facade exporting run/config
+src/tui/                 TUI runtime, context, rendering, Markdown, input, commands, state
+src/agent_workflow.rs    Agent workflow facade
+src/agent_workflow/      Automatic routing, prompt enrichment, summary, weather fallback, locations
 src/llm.rs               Rig OpenAI-compatible model client and message shaping
 src/lib.rs               Valkey-backed short term memory and prompt YAML archiving
 src/long_term_memory.rs  pgvector Markdown indexing and search
 src/weather.rs           Open-Meteo current weather tool
 src/web_search.rs        Brave Search API web search tool
+prompt/*.yaml           Main agent and sub-agent prompts
 ```
 
 ## Architecture
@@ -67,13 +75,17 @@ src/web_search.rs        Brave Search API web search tool
 TUI
  |
 |-- immediate user message display
-|-- prompt/system.yaml system prompt archive
+|-- prompt/*.yaml agent and sub-agent prompts
+|-- prompt/system.yaml generated system prompt archive
 |-- optional reasoning effort control
+|-- session token usage from Rig model responses
 |-- kept in-conversation LLM activity lines
 |-- automatic current weather router plus weather CLI
+|   |-- cleanup/alias -> Open-Meteo -> LLM location normalizer -> Open-Meteo retry
 |-- automatic web search router plus /search command
 |-- automatic request amplifier router plus /amplify command
-|-- TUI clipboard capture for Ctrl+C, Ctrl+V, bracketed paste
+|-- automatic conversation summary router plus /summary command
+|-- TUI clipboard capture for Ctrl+C, Ctrl+V, bracketed paste, mouse selection
  |
  v
 Rig workflow messages
@@ -82,7 +94,7 @@ Rig workflow messages
 Rig OpenAI-compatible provider
  |
  v
-Qwen/Qwen3.6-35B-A3B
+gpt-5.5
  ^
  |
 Valkey chat history with user/session/timestamp metadata
@@ -92,6 +104,7 @@ Valkey chat history with user/session/timestamp metadata
  |-- final answers enriched by automatic weather context
  |-- manual CLI/TUI web search results
  |-- manual CLI/TUI amplified requests
+ |-- automatic and manual CLI/TUI conversation summaries
  |-- final answers enriched by automatic web/amplifier context
  |
  v
@@ -143,36 +156,105 @@ brew install valkey
 
 ## TUI usage
 
-Start the terminal UI:
+### Before you start
+
+The TUI needs Valkey for chat history and an OpenAI-compatible model endpoint for assistant replies.
+The app automatically loads `.env` when it exists, so you can keep local URLs and keys there instead of exporting them each time.
+
+Minimum useful `.env` values:
+
+```sh
+OPENAI_API_KEY=...
+OPENAI_BASE_URL=...
+OPENAI_MODEL=gpt-5.5
+```
+
+Optional helpers:
+
+```sh
+BRAVE_SEARCH_API_KEY=...
+PGVECTOR_URL=postgres://postgres:postgres@127.0.0.1:5432/agent_memory
+```
+
+By default, each `cargo run` creates a fresh user id and session id. Use `--user-id` and `--session` when you want to continue a known history.
+
+### Start the TUI
+
+For a fresh session:
 
 ```sh
 cargo run
 ```
 
-The app automatically loads `.env` when it exists. It reads model, Valkey, weather, web-search, and pgvector settings from the process environment, so exported or inline variables still work.
-By default, each process gets a fresh generated user id and session id. Pass `--user-id` and `--session`, or set `AGENT_USER_ID`, when you want to continue a known history.
-
-Start the terminal UI with explicit options:
+For a named session:
 
 ```sh
-cargo run -- --user-id soonmo tui --session work --model Qwen/Qwen3.6-35B-A3B --reasoning-effort low
+cargo run -- --user-id soonmo tui --session work --model gpt-5.5 --reasoning-effort low
 ```
 
-The TUI loads recent chat history from Valkey, shapes the prompt flow as Rig workflow messages, sends the request through Rig's OpenAI-compatible provider, and stores the user and assistant messages back into Valkey.
-The TUI marks the status line as `Rust | Rig OpenAI-compatible provider`.
-While a response is pending, the conversation pane shows an assistant activity line between the submitted user message and the final assistant response. The activity line is kept in the conversation pane after the response arrives, while Valkey stores only user and assistant chat messages. The status line also shows the model-call flow and elapsed wait time.
-Reasoning effort is optional and is not sent by default. Use `--reasoning-effort` or `LLM_REASONING_EFFORT` when the selected provider supports it. Inside the TUI, run `/reasoning <unset|none|minimal|low|medium|high|xhigh>` or `/effort <value>` to change the value for future model and amplifier calls in the current session.
-The conversation pane can be scrolled with Up/Down, PageUp/PageDown, Home, End, and the mouse wheel.
-Conversation messages are rendered with basic Markdown support for headings, lists, quotes, code, and emphasis.
-`Ctrl+C` copies the current prompt when the prompt line has text, and exits the TUI when the prompt line is empty. `Ctrl+V` and bracketed paste insert clipboard text into the prompt, preserving pasted newlines as spaces.
-Normal chat automatically fetches current weather from Open-Meteo for weather prompts such as `Seoul current weather` or `서울 현재 날씨`, then passes the weather report into the model as context.
-Normal chat automatically searches the web for current information requests such as latest/current/news/price prompts, then passes the result summary into the model as context.
-Normal chat automatically asks the request amplifier sub-agent to expand vague requests such as `make it better`, then asks the main model to answer the amplified request while preserving the original intent.
-When `PGVECTOR_URL` is set and Markdown has been indexed, normal chat also searches long term memory and passes the most relevant local Markdown chunks into the model as optional context.
-Run `/search <query>` or `/web <query>` in the TUI to force a standalone web search. Search requests and result summaries are saved as user/assistant messages; the web-search action line is display-only.
-Run `/amplify <request>` in the TUI to force a standalone request amplification. Amplification requests and results are saved as user/assistant messages; the amplifier action line is display-only.
+### Inside the TUI
 
-The agent system prompt is saved to `prompt/system.yaml`. Chat history is saved in Valkey, not in `prompt/`.
+Type a message and press Enter. Your message appears immediately, then the conversation pane keeps a live assistant activity line with elapsed time, such as `2.12s`, while the model is working. The status line shows cumulative session token usage when the provider returns usage metrics.
+
+Common controls:
+
+```text
+Up / Down            scroll conversation one row
+PageUp / PageDown    scroll conversation faster
+Home / End           jump to top or bottom
+Mouse wheel          scroll conversation
+Mouse drag           copy selected conversation text
+Ctrl+V               paste clipboard text
+Ctrl+C               copy the prompt when input has text
+Ctrl+C               exit when input is empty
+Esc                  exit
+```
+
+Useful TUI commands:
+
+```text
+/reasoning low       set reasoning effort for future model calls
+/reasoning unset     stop sending reasoning effort
+/copy                copy conversation, status, token usage, model, and session
+/search <query>      force a standalone Brave web search
+/web <query>         same as /search
+/amplify <request>   force request amplification
+/summary             summarize the current saved conversation
+```
+
+Normal chat automatically adds extra context when it helps:
+
+- Weather questions call Open-Meteo first, for example `what's the weather today in Seoul?`, `Seoul current weather`, or `서울 현재 날씨`.
+- After a weather question, short follow-ups such as `부산은?` or `what about Busan?` are treated as weather questions for the new location.
+- Pronoun weather follow-ups such as `how's the weather of it?` and `weather there?` reuse the most recent place discussed in the chat.
+- Common Korean weather locations are normalized before geocoding, for example `오늘 서울날씨는?` uses `Seoul` and `부에노스아이레스 날씨는?` uses `Buenos Aires`.
+- If direct geocoding fails for a Korean or other non-English location, only the extracted location name is sent to a small weather location normalizer. For example `치앙마이 날씨는?` can retry Open-Meteo as `Chiang Mai` when model credentials are configured.
+- Current-information prompts call Brave Search first, for example `latest Rust release`.
+- Vague requests call the request amplifier first, for example `make it better`.
+- Conversation summary requests call the summary sub-agent first, for example `summarize our conversation`, `sum up what we talked about`, or `이 대화 요약해줘`.
+- If `PGVECTOR_URL` is set and Markdown has been indexed, local Markdown memory is searched first.
+
+### Request flow
+
+```text
+User input
+ |
+ |-- optional summary / weather / web search / amplifier / long-term memory routing
+ |
+ v
+Rig workflow messages
+ |
+ v
+Rig OpenAI-compatible provider
+ |
+ v
+Assistant response
+ |
+ v
+Valkey chat history
+```
+
+Agent and sub-agent prompts live in `prompt/*.yaml` using the same `role` and `prompt` format as `prompt/system.yaml`. The generated main system prompt archive is saved to `prompt/system.yaml`. Chat history is saved in Valkey, not in `prompt/`.
 
 Example `.env` keys:
 
@@ -180,7 +262,7 @@ Example `.env` keys:
 AGENT_USER_ID=soonmo
 OPENAI_API_KEY=...
 OPENAI_BASE_URL=...
-OPENAI_MODEL=Qwen/Qwen3.6-35B-A3B
+OPENAI_MODEL=gpt-5.5
 LLM_REASONING_EFFORT=low
 LLM_TIMEOUT_SECONDS=30
 BRAVE_SEARCH_API_KEY=...
@@ -242,7 +324,14 @@ Fetch current weather:
 
 ```sh
 cargo run -- weather Seoul
+cargo run -- weather 부산은
+cargo run -- weather "오늘 서울날씨는?"
+cargo run -- weather "부에노스아이레스 날씨는?"
+cargo run -- weather "아르헨티나 날씨는?"
+cargo run -- weather "치앙마이 날씨는?" --model gpt-5.5 --reasoning-effort low
 ```
+
+The `weather` command uses deterministic cleanup and aliases first. If Open-Meteo cannot geocode the location directly, it can use the same model credentials as chat to translate only the extracted location name, then retries Open-Meteo once.
 
 Index local Markdown into pgvector long term memory:
 
@@ -264,6 +353,12 @@ Amplify a request:
 cargo run -- amplify "make the tui better"
 ```
 
+Summarize a saved chat session:
+
+```sh
+cargo run -- summary --session work --reasoning-effort low
+```
+
 Save, read, and delete a simple short term memory value:
 
 ```sh
@@ -275,7 +370,7 @@ cargo run -- forget smoke:value
 Change the OpenAI model:
 
 ```sh
-OPENAI_MODEL=Qwen/Qwen3.6-35B-A3B cargo run -- chat "hello"
+OPENAI_MODEL=gpt-5.5 cargo run -- chat "hello"
 ```
 
 Control reasoning effort for a latency-sensitive chat turn:
@@ -307,9 +402,10 @@ GitHub Actions runs `cargo fmt --check`, `cargo test`, `cargo clippy -- -D warni
 - Chat session: generated per command unless `--session` is set
 - Chat history limit: `20`
 - Chat TTL: `86400` seconds
-- OpenAI model: `Qwen/Qwen3.6-35B-A3B`
+- OpenAI model: `gpt-5.5`
 - Reasoning effort: unset unless `--reasoning-effort` or `LLM_REASONING_EFFORT` is provided
 - Weather API: Open-Meteo geocoding and forecast endpoints
+- Weather location fallback: uses `OPENAI_MODEL` or `--model` and optional `LLM_REASONING_EFFORT` or `--reasoning-effort`
 - Web search URL: `https://api.search.brave.com/res/v1/web/search`
 - Web search limit: `5`
 - Web search API key: `BRAVE_SEARCH_API_KEY` or `WEB_SEARCH_API_KEY`
@@ -330,4 +426,4 @@ cargo tree | rg "async-openai|rig-core"
 git diff --check
 ```
 
-Live TUI, live pgvector indexing/search, Brave search requests, and `chat` model calls require local services or provider credentials and have not been verified in this session.
+Interactive TUI, live pgvector indexing/search, and Brave search requests require local services or provider credentials and have not been verified in this session. Weather CLI and `chat` weather fallback were verified with model credentials.

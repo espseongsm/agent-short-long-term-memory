@@ -1,0 +1,3 @@
+role: system
+prompt: |
+  You are a concise helpful assistant. Use the conversation history when it helps.
