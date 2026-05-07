@@ -5,7 +5,7 @@
 ## 2026-05-06 (수요일)
 
 - 사용자 ID, 세션 ID, 타임스탬프, 역할, 내용을 포함한 Valkey 기반 단기 채팅 기록 저장을 구현했다.
-- 기본 모델 `Qwen/Qwen3.6-35B-A3B`를 사용하는 OpenAI 호환 모델 호출에 Rig 워크플로 메시지 구성을 연결했다.
+- 기본 모델 `gpt-5.5`를 사용하는 OpenAI 호환 모델 호출에 Rig 워크플로 메시지 구성을 연결했다.
 - 영어/한국어 입력, Markdown 대화 렌더링, 즉시 사용자 메시지 표시, 키보드/마우스 스크롤을 지원하는 Ratatui TUI를 구축했다.
 - 오래 걸리는 모델 응답 중 TUI 상태와 대화창 안 LLM 활동 보존을 추가하고, 날씨/웹 검색 도구와 요청 증폭 서브에이전트를 자동 라우팅과 CLI/TUI 명령에 연결했다.
 - `Ctrl+C`/`Ctrl+V` 캡처와 붙여넣기 줄바꿈 정리, TUI 내부 reasoning effort 제어, pgvector 기반 로컬 Markdown 장기 메모리 색인/검색을 추가하고 문서를 갱신했다.
@@ -16,7 +16,7 @@
 - 모델 호출에서 `async-openai` 의존성을 제거하고 Rig의 OpenAI 호환 provider로 직접 요청을 보내도록 바꿨다.
 - DuckDuckGo 즉답 기반 검색을 Brave Search API 기반 전체 웹 검색으로 교체하고, `.env`의 `BRAVE_SEARCH_API_KEY`/`WEB_SEARCH_API_KEY`를 사용하도록 했다.
 - README에 코드 레이아웃을 추가해 빌드/사용 설명과 함께 주요 모듈의 역할을 빠르게 파악할 수 있게 했다.
-- PRD 적용 후 형식 검사, 단위 테스트, Clippy, CLI 도움말 스모크 체크로 동작을 확인했다.
+- PRD와 기본 모델을 맞추고 TUI 마우스 드래그 대화 선택 복사, 소수점 경과 시간 표시와 세션 token usage 표시, 한국어/외국 날씨 위치 정규화와 LLM fallback, `it/there` 날씨 후속 질문 해석, 자동 대화 요약 서브에이전트, `prompt/` YAML 기반 agent prompt를 추가했으며, 긴 `main`/`tui`/`agent_workflow` 소스를 책임별 모듈로 분리했다.
 
 ### 검증
 
@@ -27,6 +27,9 @@ CARGO_TARGET_DIR=target/codex-rig-search cargo clippy -- -D warnings
 CARGO_TARGET_DIR=target/codex-rig-search cargo run --quiet -- --help
 CARGO_TARGET_DIR=target/codex-rig-search cargo run --quiet -- tui --help
 CARGO_TARGET_DIR=target/codex-rig-search cargo run --quiet -- web-search --help
+CARGO_TARGET_DIR=target/codex-rig-search cargo run --quiet -- summary --help
+cargo run --quiet -- weather "치앙마이 날씨는?" --reasoning-effort low
+cargo run --quiet -- chat "치앙마이 날씨는?" --reasoning-effort low
 cargo tree | rg "async-openai|rig-core"
 git diff --check
 ```
@@ -36,13 +39,18 @@ git diff --check
 ```text
 TUI / chat CLI
  |
- |-- prompt/system.yaml
+ |-- cli definitions/defaults/runtime ids
+ |-- prompt/*.yaml agent prompts
+ |-- prompt/system.yaml generated archive
  |-- live pending-response status
  |-- kept in-conversation LLM activity
+ |-- session token usage display
+ |-- automatic summary agent + CLI/TUI command
  |-- automatic current weather routing + CLI command
+ |   |-- cleanup/alias -> Open-Meteo -> location normalizer -> Open-Meteo retry
  |-- automatic web search routing + CLI/TUI command
  |-- automatic request amplifier routing + CLI/TUI command
- |-- Ctrl+C / Ctrl+V clipboard capture
+ |-- Ctrl+C / Ctrl+V / mouse selection clipboard capture
  |-- optional reasoning effort control
  |-- Markdown conversation rendering
  |-- keyboard and mouse conversation scrolling

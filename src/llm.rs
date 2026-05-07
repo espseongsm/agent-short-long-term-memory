@@ -7,6 +7,7 @@ use rig::{
     OneOrMany,
     completion::{
         AssistantContent, CompletionModel as _, CompletionRequest, Message as RigMessage,
+        Usage as RigTokenUsage,
     },
     prelude::CompletionClient,
     providers::openai,
@@ -24,6 +25,47 @@ pub enum ReasoningEffort {
     Medium,
     High,
     Xhigh,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct TokenUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub total_tokens: u64,
+    pub cached_input_tokens: u64,
+    pub cache_creation_input_tokens: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LlmResponse {
+    pub text: String,
+    pub usage: TokenUsage,
+}
+
+impl TokenUsage {
+    pub fn add(&mut self, usage: Self) {
+        self.input_tokens += usage.input_tokens;
+        self.output_tokens += usage.output_tokens;
+        self.total_tokens += usage.total_tokens;
+        self.cached_input_tokens += usage.cached_input_tokens;
+        self.cache_creation_input_tokens += usage.cache_creation_input_tokens;
+    }
+
+    pub fn has_usage(self) -> bool {
+        self.input_tokens > 0 || self.output_tokens > 0 || self.total_tokens > 0
+    }
+}
+
+impl From<RigTokenUsage> for TokenUsage {
+    fn from(usage: RigTokenUsage) -> Self {
+        Self {
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            total_tokens: usage.total_tokens,
+            cached_input_tokens: usage.cached_input_tokens,
+            cache_creation_input_tokens: usage.cache_creation_input_tokens,
+        }
+    }
 }
 
 impl ReasoningEffort {
@@ -64,14 +106,14 @@ impl fmt::Display for ReasoningEffort {
 #[derive(Clone)]
 pub struct LlmClient {
     model: openai::CompletionModel,
-    preamble: &'static str,
+    preamble: String,
     reasoning_effort: Option<ReasoningEffort>,
 }
 
 impl LlmClient {
     pub fn from_env(
         model: String,
-        preamble: &'static str,
+        preamble: impl Into<String>,
         reasoning_effort: Option<ReasoningEffort>,
     ) -> Result<Self> {
         let api_key =
@@ -88,20 +130,34 @@ impl LlmClient {
 
         Ok(Self {
             model: client.completion_model(model),
-            preamble,
+            preamble: preamble.into(),
             reasoning_effort,
         })
     }
 
     pub async fn chat(&self, history: &[ChatEntry], prompt: &str) -> Result<String> {
-        let workflow_messages = rig_workflow_messages(self.preamble, history, prompt);
+        Ok(self.chat_with_usage(history, prompt).await?.text)
+    }
+
+    pub async fn chat_with_usage(
+        &self,
+        history: &[ChatEntry],
+        prompt: &str,
+    ) -> Result<LlmResponse> {
+        let workflow_messages = rig_workflow_messages(&self.preamble, history, prompt);
         let request = rig_completion_request(workflow_messages, self.reasoning_effort)?;
         let response = tokio::time::timeout(chat_timeout(), self.model.completion(request))
             .await
             .context("chat completion timed out")?
             .context("failed to create chat completion through Rig")?;
 
-        assistant_text(&response.choice).context("chat completion response did not include text")
+        let text = assistant_text(&response.choice)
+            .context("chat completion response did not include text")?;
+
+        Ok(LlmResponse {
+            text,
+            usage: response.usage.into(),
+        })
     }
 }
 
@@ -250,6 +306,36 @@ mod tests {
         .unwrap();
 
         assert_eq!(assistant_text(&choice), Some("hello\nworld".to_string()));
+    }
+
+    #[test]
+    fn token_usage_accumulates_usage() {
+        let mut usage = TokenUsage {
+            input_tokens: 10,
+            output_tokens: 5,
+            total_tokens: 15,
+            cached_input_tokens: 3,
+            cache_creation_input_tokens: 0,
+        };
+
+        usage.add(TokenUsage {
+            input_tokens: 7,
+            output_tokens: 4,
+            total_tokens: 11,
+            cached_input_tokens: 2,
+            cache_creation_input_tokens: 1,
+        });
+
+        assert_eq!(
+            usage,
+            TokenUsage {
+                input_tokens: 17,
+                output_tokens: 9,
+                total_tokens: 26,
+                cached_input_tokens: 5,
+                cache_creation_input_tokens: 1,
+            }
+        );
     }
 
     #[test]
