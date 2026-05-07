@@ -2,7 +2,7 @@
 
 ## Multi-agent workflow
 
-- Use an OpenAI-compatible SDK for model calls.
+- Use Rig's OpenAI-compatible provider for model calls.
 - Use Rig as a main framework for agent workflow such as overall process, prompts and agent communication
 - Default model is `Qwen/Qwen3.6-35B-A3B`.
 - Chat history is saved in Valkey.
@@ -15,7 +15,7 @@
 - what llm does should be shown in tui because response often takes time. And the user will be bored. Please shows llm's actions in the middle of conversation between user and assistant. Keep the llm's action in the conversation pane.
 - control reasoning effort of llm for latency. It can be controlled in tui.
 - add current weather tool, which is automatically called for weather questions
-- add web search tool, which is automatically called
+- add full web search API tool, which is automatically called
 - user request amplifier: this is an sub-agent that amplifies the user's request when the request is too simple to answer correctly, which is automatically called.
 - tui supports captures such as ctrl+c and ctrl+v
 
@@ -37,3 +37,13 @@
 - create a daily progress report(Korean) in markdown format such as what we have developed in a day.
 - One file contains all working days's progress.
 - Daily progress is summed up in five bullet points at maximum
+
+## README
+
+- easy to understand this repo in terms of how to build, use, and have developed.
+- keep format neat.
+
+## Coding convension
+
+- modulize as much as easy to understand.
+- main.rs is the entry point of this repo.

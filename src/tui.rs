@@ -308,7 +308,11 @@ async fn run_app(
                             }
                         };
 
-                        start_prompt_submission(config, app, history, prompt_for_llm);
+                        if let Err(error) =
+                            start_prompt_submission(config, app, history, prompt_for_llm)
+                        {
+                            app.status = format_error_chain(&error);
+                        }
                     }
                     _ => {}
                 }
@@ -361,7 +365,7 @@ async fn submit_web_search(
     let action_index = remember_agent_action(
         app,
         app.entries.len(),
-        "web search: querying DuckDuckGo-compatible endpoint",
+        "web search: querying Brave Search API",
     );
     app.status = format!("web search: searching `{query}`");
     terminal.draw(|frame| render(frame, app, config))?;
@@ -437,7 +441,8 @@ async fn submit_request_amplification(
         config.model.clone(),
         config.amplifier_preamble,
         app.reasoning_effort,
-    );
+    )
+    .context("failed to init request amplifier")?;
     let amplified = match request_amplifier.chat(&[], request).await {
         Ok(amplified) => amplified,
         Err(error) => {
@@ -482,8 +487,9 @@ fn start_prompt_submission(
     app: &mut App,
     history: Vec<ChatEntry>,
     prompt: String,
-) {
-    let llm = LlmClient::from_env(config.model.clone(), config.preamble, app.reasoning_effort);
+) -> Result<()> {
+    let llm = LlmClient::from_env(config.model.clone(), config.preamble, app.reasoning_effort)
+        .context("failed to init LLM client")?;
     let action_index = remember_agent_action(
         app,
         app.entries.len(),
@@ -497,6 +503,8 @@ fn start_prompt_submission(
         action_index,
     });
     app.status = "LLM: Rig workflow -> OpenAI-compatible request -> waiting for model".to_string();
+
+    Ok(())
 }
 
 async fn prepare_automatic_chat_prompt(
@@ -524,20 +532,31 @@ async fn prepare_automatic_chat_prompt(
             config.amplifier_preamble,
             app.reasoning_effort,
         );
-        match request_amplifier.chat(history, prompt).await {
-            Ok(amplified) => {
-                set_agent_action(
-                    app,
-                    action_index,
-                    "request amplifier: produced automatic amplified request".to_string(),
-                );
-                prompt_for_llm = agent_workflow::prompt_with_amplification(prompt, &amplified);
-            }
+        match request_amplifier {
+            Ok(request_amplifier) => match request_amplifier.chat(history, prompt).await {
+                Ok(amplified) => {
+                    set_agent_action(
+                        app,
+                        action_index,
+                        "request amplifier: produced automatic amplified request".to_string(),
+                    );
+                    prompt_for_llm = agent_workflow::prompt_with_amplification(prompt, &amplified);
+                }
+                Err(error) => {
+                    set_agent_action(
+                        app,
+                        action_index,
+                        "request amplifier: automatic request failed; continuing with original request"
+                            .to_string(),
+                    );
+                    app.status = format_error_chain(&error);
+                }
+            },
             Err(error) => {
                 set_agent_action(
                     app,
                     action_index,
-                    "request amplifier: automatic request failed; continuing with original request"
+                    "request amplifier: automatic init failed; continuing with original request"
                         .to_string(),
                 );
                 app.status = format_error_chain(&error);
@@ -814,7 +833,7 @@ fn render_input(frame: &mut Frame, area: Rect, input: &str) {
 
 fn render_status(frame: &mut Frame, area: Rect, app: &App, config: &TuiConfig) {
     let status = format!(
-        "Rust | Rig workflow + OpenAI SDK | session: {} | model: {} | reasoning: {} | {}",
+        "Rust | Rig OpenAI-compatible provider | session: {} | model: {} | reasoning: {} | {}",
         config.session,
         config.model,
         reasoning_effort_label(app.reasoning_effort),

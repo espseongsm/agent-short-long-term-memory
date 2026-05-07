@@ -1,18 +1,17 @@
 use std::{fmt, time::Duration};
 
 use agent_memory::{ChatEntry, ChatRole};
-use anyhow::{Context, Result, bail};
-use async_openai::{
-    Client,
-    config::OpenAIConfig,
-    types::chat::{
-        ChatCompletionRequestAssistantMessageArgs, ChatCompletionRequestMessage,
-        ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestUserMessageArgs,
-        CreateChatCompletionRequest, CreateChatCompletionRequestArgs,
-        ReasoningEffort as OpenAiReasoningEffort,
-    },
-};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::ValueEnum;
+use rig::{
+    OneOrMany,
+    completion::{
+        AssistantContent, CompletionModel as _, CompletionRequest, Message as RigMessage,
+    },
+    prelude::CompletionClient,
+    providers::openai,
+};
+use serde_json::json;
 
 const DEFAULT_CHAT_TIMEOUT_SECONDS: u64 = 30;
 
@@ -45,17 +44,6 @@ impl ReasoningEffort {
             ),
         }
     }
-
-    fn to_openai(self) -> OpenAiReasoningEffort {
-        match self {
-            Self::None => OpenAiReasoningEffort::None,
-            Self::Minimal => OpenAiReasoningEffort::Minimal,
-            Self::Low => OpenAiReasoningEffort::Low,
-            Self::Medium => OpenAiReasoningEffort::Medium,
-            Self::High => OpenAiReasoningEffort::High,
-            Self::Xhigh => OpenAiReasoningEffort::Xhigh,
-        }
-    }
 }
 
 impl fmt::Display for ReasoningEffort {
@@ -73,18 +61,9 @@ impl fmt::Display for ReasoningEffort {
     }
 }
 
-use rig::{
-    OneOrMany,
-    completion::{
-        AssistantContent, Message as RigMessage,
-        message::{Text, UserContent},
-    },
-};
-
 #[derive(Clone)]
 pub struct LlmClient {
-    client: Client<OpenAIConfig>,
-    model: String,
+    model: openai::CompletionModel,
     preamble: &'static str,
     reasoning_effort: Option<ReasoningEffort>,
 }
@@ -94,70 +73,99 @@ impl LlmClient {
         model: String,
         preamble: &'static str,
         reasoning_effort: Option<ReasoningEffort>,
-    ) -> Self {
-        let mut config = OpenAIConfig::new();
-        let openai_api_key = std::env::var("OPENAI_API_KEY").ok();
+    ) -> Result<Self> {
+        let api_key =
+            llm_api_key().context("OPENAI_API_KEY or BEARER_TOKEN must be set for model calls")?;
+        let mut builder = openai::CompletionsClient::builder().api_key(api_key);
 
-        if let Some(api_key) = openai_api_key
-            .as_deref()
-            .filter(|value| !looks_like_url(value))
-            .map(ToOwned::to_owned)
-            .or_else(|| std::env::var("BEARER_TOKEN").ok())
-        {
-            config = config.with_api_key(api_key);
+        if let Some(api_base) = llm_api_base() {
+            builder = builder.base_url(api_base);
         }
 
-        if let Some(api_base) = std::env::var("OPENAI_BASE_URL")
-            .or_else(|_| std::env::var("OPENAI_API_BASE"))
-            .ok()
-            .or_else(|| openai_api_key.filter(|value| looks_like_url(value)))
-        {
-            config = config.with_api_base(api_base);
-        }
+        let client = builder
+            .build()
+            .context("failed to build Rig OpenAI-compatible client")?;
 
-        Self {
-            client: Client::with_config(config),
-            model,
+        Ok(Self {
+            model: client.completion_model(model),
             preamble,
             reasoning_effort,
-        }
+        })
     }
 
     pub async fn chat(&self, history: &[ChatEntry], prompt: &str) -> Result<String> {
         let workflow_messages = rig_workflow_messages(self.preamble, history, prompt);
-        let request =
-            chat_completion_request(&self.model, &workflow_messages, self.reasoning_effort)?;
-        let response = tokio::time::timeout(chat_timeout(), self.client.chat().create(request))
+        let request = rig_completion_request(workflow_messages, self.reasoning_effort)?;
+        let response = tokio::time::timeout(chat_timeout(), self.model.completion(request))
             .await
             .context("chat completion timed out")?
-            .context("failed to create chat completion")?;
+            .context("failed to create chat completion through Rig")?;
 
-        response
-            .choices
-            .into_iter()
-            .next()
-            .and_then(|choice| choice.message.content)
-            .context("chat completion response did not include assistant text")
+        assistant_text(&response.choice).context("chat completion response did not include text")
     }
 }
 
-fn chat_completion_request(
-    model: &str,
-    workflow_messages: &[RigMessage],
+fn llm_api_key() -> Option<String> {
+    let openai_api_key = std::env::var("OPENAI_API_KEY").ok();
+
+    openai_api_key
+        .as_deref()
+        .filter(|value| !looks_like_url(value))
+        .map(ToOwned::to_owned)
+        .or_else(|| std::env::var("BEARER_TOKEN").ok())
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn llm_api_base() -> Option<String> {
+    std::env::var("OPENAI_BASE_URL")
+        .or_else(|_| std::env::var("OPENAI_API_BASE"))
+        .ok()
+        .or_else(|| {
+            std::env::var("OPENAI_API_KEY")
+                .ok()
+                .filter(|value| looks_like_url(value))
+        })
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn rig_completion_request(
+    workflow_messages: Vec<RigMessage>,
     reasoning_effort: Option<ReasoningEffort>,
-) -> Result<CreateChatCompletionRequest> {
-    let mut request = CreateChatCompletionRequestArgs::default();
-    request
-        .model(model)
-        .messages(openai_messages(workflow_messages)?);
+) -> Result<CompletionRequest> {
+    Ok(CompletionRequest {
+        model: None,
+        preamble: None,
+        chat_history: OneOrMany::many(workflow_messages)
+            .map_err(|_| anyhow!("chat completion requires at least one Rig message"))?,
+        documents: Vec::new(),
+        tools: Vec::new(),
+        temperature: None,
+        max_tokens: None,
+        tool_choice: None,
+        additional_params: reasoning_effort_params(reasoning_effort),
+        output_schema: None,
+    })
+}
 
-    if let Some(reasoning_effort) = reasoning_effort {
-        request.reasoning_effort(reasoning_effort.to_openai());
-    }
+fn reasoning_effort_params(reasoning_effort: Option<ReasoningEffort>) -> Option<serde_json::Value> {
+    reasoning_effort.map(|reasoning_effort| {
+        json!({
+            "reasoning_effort": reasoning_effort.to_string()
+        })
+    })
+}
 
-    request
-        .build()
-        .context("failed to build chat completion request")
+fn assistant_text(choice: &OneOrMany<AssistantContent>) -> Option<String> {
+    let text = choice
+        .iter()
+        .filter_map(|content| match content {
+            AssistantContent::Text(text) => Some(text.text.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    if text.is_empty() { None } else { Some(text) }
 }
 
 fn looks_like_url(value: &str) -> bool {
@@ -177,83 +185,21 @@ fn chat_timeout_from_value(value: Option<&str>) -> Duration {
 }
 
 fn rig_workflow_messages(preamble: &str, history: &[ChatEntry], prompt: &str) -> Vec<RigMessage> {
-    let mut messages = vec![RigMessage::System {
-        content: preamble.to_string(),
-    }];
+    let mut messages = vec![RigMessage::system(preamble)];
 
     for entry in history {
         messages.push(rig_chat_entry_message(entry));
     }
 
-    messages.push(RigMessage::User {
-        content: OneOrMany::one(UserContent::text(prompt)),
-    });
-
+    messages.push(RigMessage::user(prompt));
     messages
 }
 
 fn rig_chat_entry_message(entry: &ChatEntry) -> RigMessage {
     match entry.role {
-        ChatRole::User => RigMessage::User {
-            content: OneOrMany::one(UserContent::text(entry.content.clone())),
-        },
-        ChatRole::Assistant => RigMessage::Assistant {
-            id: None,
-            content: OneOrMany::one(AssistantContent::text(entry.content.clone())),
-        },
+        ChatRole::User => RigMessage::user(entry.content.clone()),
+        ChatRole::Assistant => RigMessage::assistant(entry.content.clone()),
     }
-}
-
-fn openai_messages(messages: &[RigMessage]) -> Result<Vec<ChatCompletionRequestMessage>> {
-    messages.iter().map(openai_message).collect()
-}
-
-fn openai_message(message: &RigMessage) -> Result<ChatCompletionRequestMessage> {
-    match message {
-        RigMessage::System { content } => Ok(ChatCompletionRequestSystemMessageArgs::default()
-            .content(content.clone())
-            .build()
-            .context("failed to build system message")?
-            .into()),
-        RigMessage::User { content } => Ok(ChatCompletionRequestUserMessageArgs::default()
-            .content(rig_user_text(content))
-            .build()
-            .context("failed to build user message")?
-            .into()),
-        RigMessage::Assistant { content, .. } => {
-            Ok(ChatCompletionRequestAssistantMessageArgs::default()
-                .content(rig_assistant_text(content))
-                .build()
-                .context("failed to build assistant message")?
-                .into())
-        }
-    }
-}
-
-fn rig_user_text(content: &OneOrMany<UserContent>) -> String {
-    content
-        .iter()
-        .filter_map(|content| match content {
-            UserContent::Text(text) => Some(text_to_string(text)),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-fn rig_assistant_text(content: &OneOrMany<AssistantContent>) -> String {
-    content
-        .iter()
-        .filter_map(|content| match content {
-            AssistantContent::Text(text) => Some(text_to_string(text)),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-fn text_to_string(text: &Text) -> String {
-    text.text.clone()
 }
 
 #[cfg(test)]
@@ -277,44 +223,33 @@ mod tests {
     }
 
     #[test]
-    fn openai_messages_are_built_from_rig_workflow_messages() {
-        let history = vec![
-            ChatEntry::new(ChatRole::User, "hello"),
-            ChatEntry::new(ChatRole::Assistant, "hi"),
-        ];
-        let rig_messages = rig_workflow_messages("system", &history, "next");
-        let messages = openai_messages(&rig_messages).unwrap();
+    fn rig_completion_request_omits_reasoning_effort_when_unset() {
+        let messages = rig_workflow_messages("system", &[], "next");
+        let request = rig_completion_request(messages, None).unwrap();
 
-        assert_eq!(messages.len(), 4);
-        assert!(matches!(
-            messages[0],
-            ChatCompletionRequestMessage::System(_)
-        ));
-        assert!(matches!(messages[1], ChatCompletionRequestMessage::User(_)));
-        assert!(matches!(
-            messages[2],
-            ChatCompletionRequestMessage::Assistant(_)
-        ));
-        assert!(matches!(messages[3], ChatCompletionRequestMessage::User(_)));
+        assert!(request.additional_params.is_none());
     }
 
     #[test]
-    fn chat_request_omits_reasoning_effort_when_unset() {
-        let rig_messages = rig_workflow_messages("system", &[], "next");
-        let request = chat_completion_request("model", &rig_messages, None).unwrap();
-        let value = serde_json::to_value(request).unwrap();
+    fn rig_completion_request_includes_reasoning_effort_when_set() {
+        let messages = rig_workflow_messages("system", &[], "next");
+        let request = rig_completion_request(messages, Some(ReasoningEffort::Low)).unwrap();
 
-        assert!(value.get("reasoning_effort").is_none());
+        assert_eq!(
+            request.additional_params.unwrap()["reasoning_effort"],
+            "low"
+        );
     }
 
     #[test]
-    fn chat_request_includes_reasoning_effort_when_set() {
-        let rig_messages = rig_workflow_messages("system", &[], "next");
-        let request =
-            chat_completion_request("model", &rig_messages, Some(ReasoningEffort::Low)).unwrap();
-        let value = serde_json::to_value(request).unwrap();
+    fn extracts_assistant_text_from_rig_response_choice() {
+        let choice = OneOrMany::many(vec![
+            AssistantContent::text("hello"),
+            AssistantContent::text("world"),
+        ])
+        .unwrap();
 
-        assert_eq!(value["reasoning_effort"], "low");
+        assert_eq!(assistant_text(&choice), Some("hello\nworld".to_string()));
     }
 
     #[test]

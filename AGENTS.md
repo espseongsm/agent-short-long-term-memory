@@ -79,6 +79,10 @@ Strong success criteria let you loop independently. Weak criteria ("make it work
 
 - Whenever coding is done as per my request, please visualize the flow and architecture.
 
+## 8. Git
+
+- When pushing new feature development, please use a new branch.
+
 ---
 
 **These guidelines are working if:** fewer unnecessary changes in diffs, fewer rewrites due to overcomplication, and clarifying questions come before implementation rather than after mistakes.

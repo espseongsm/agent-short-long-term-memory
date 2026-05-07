@@ -1,19 +1,25 @@
 use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
-use reqwest::StatusCode;
+use reqwest::{StatusCode, header};
 use serde::Deserialize;
 
 pub const DEFAULT_WEB_SEARCH_LIMIT: usize = 5;
 
-const DEFAULT_WEB_SEARCH_URL: &str = "https://api.duckduckgo.com/";
+const DEFAULT_WEB_SEARCH_URL: &str = "https://api.search.brave.com/res/v1/web/search";
 const DEFAULT_WEB_SEARCH_TIMEOUT_SECONDS: u64 = 10;
 
 #[derive(Clone)]
 pub struct WebSearchClient {
     client: reqwest::Client,
     url: String,
-    api_key: Option<String>,
+    auth: Option<WebSearchAuth>,
+}
+
+#[derive(Clone)]
+enum WebSearchAuth {
+    SubscriptionToken(String),
+    BearerToken(String),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -30,32 +36,24 @@ pub struct SearchResult {
 }
 
 #[derive(Debug, Deserialize)]
-struct DuckDuckGoResponse {
-    #[serde(default, rename = "Heading")]
-    heading: String,
-    #[serde(default, rename = "AbstractText")]
-    abstract_text: String,
-    #[serde(default, rename = "AbstractURL")]
-    abstract_url: String,
-    #[serde(default, rename = "Results")]
-    results: Vec<DuckDuckGoTopic>,
-    #[serde(default, rename = "RelatedTopics")]
-    related_topics: Vec<DuckDuckGoTopic>,
+struct BraveSearchResponse {
+    web: Option<BraveWebResults>,
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(untagged)]
-enum DuckDuckGoTopic {
-    Section {
-        #[serde(rename = "Topics")]
-        topics: Vec<DuckDuckGoTopic>,
-    },
-    Topic {
-        #[serde(default, rename = "Text")]
-        text: String,
-        #[serde(default, rename = "FirstURL")]
-        first_url: String,
-    },
+struct BraveWebResults {
+    #[serde(default)]
+    results: Vec<BraveSearchResult>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BraveSearchResult {
+    title: String,
+    url: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    extra_snippets: Vec<String>,
 }
 
 impl WebSearchClient {
@@ -64,20 +62,13 @@ impl WebSearchClient {
             .ok()
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| DEFAULT_WEB_SEARCH_URL.to_string());
-        let api_key = std::env::var("WEB_SEARCH_API_KEY")
-            .or_else(|_| std::env::var("WEB_SEARCH_BEARER_TOKEN"))
-            .ok()
-            .filter(|value| !value.trim().is_empty());
+        let auth = web_search_auth();
         let client = reqwest::Client::builder()
             .timeout(web_search_timeout())
             .build()
             .context("failed to build web search HTTP client")?;
 
-        Ok(Self {
-            client,
-            url,
-            api_key,
-        })
+        Ok(Self { client, url, auth })
     }
 
     pub async fn search(&self, query: &str, limit: usize) -> Result<WebSearchResults> {
@@ -85,15 +76,30 @@ impl WebSearchClient {
         ensure!(!query.is_empty(), "web search query cannot be empty");
         ensure!(limit > 0, "web search limit must be greater than zero");
 
-        let mut request = self.client.get(&self.url).query(&[
-            ("q", query),
-            ("format", "json"),
-            ("no_html", "1"),
-            ("skip_disambig", "1"),
-        ]);
+        let count = limit.min(20).to_string();
+        let mut request = self
+            .client
+            .get(&self.url)
+            .query(&[
+                ("q", query),
+                ("count", count.as_str()),
+                ("extra_snippets", "true"),
+            ])
+            .header(header::ACCEPT, "application/json");
 
-        if let Some(api_key) = &self.api_key {
-            request = request.bearer_auth(api_key);
+        match &self.auth {
+            Some(WebSearchAuth::SubscriptionToken(api_key)) => {
+                request = request.header("X-Subscription-Token", api_key);
+            }
+            Some(WebSearchAuth::BearerToken(api_key)) => {
+                request = request.bearer_auth(api_key);
+            }
+            None => {
+                ensure!(
+                    !is_default_brave_url(&self.url),
+                    "BRAVE_SEARCH_API_KEY or WEB_SEARCH_API_KEY must be set for Brave Search"
+                );
+            }
         }
 
         let response = request
@@ -103,11 +109,11 @@ impl WebSearchClient {
         let status = response.status();
         ensure_success_status(status)?;
         let response = response
-            .json::<DuckDuckGoResponse>()
+            .json::<BraveSearchResponse>()
             .await
-            .context("failed to parse web search response")?;
+            .context("failed to parse Brave Search response")?;
 
-        Ok(parse_duckduckgo_results(query, response, limit))
+        Ok(parse_brave_results(query, response, limit))
     }
 }
 
@@ -133,27 +139,32 @@ impl WebSearchResults {
     }
 }
 
-fn parse_duckduckgo_results(
+fn web_search_auth() -> Option<WebSearchAuth> {
+    std::env::var("BRAVE_SEARCH_API_KEY")
+        .or_else(|_| std::env::var("WEB_SEARCH_API_KEY"))
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(WebSearchAuth::SubscriptionToken)
+        .or_else(|| {
+            std::env::var("WEB_SEARCH_BEARER_TOKEN")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .map(WebSearchAuth::BearerToken)
+        })
+}
+
+fn parse_brave_results(
     query: &str,
-    response: DuckDuckGoResponse,
+    response: BraveSearchResponse,
     limit: usize,
 ) -> WebSearchResults {
-    let mut results = Vec::new();
-
-    push_result(
-        &mut results,
-        response.heading.trim(),
-        response.abstract_url.trim(),
-        response.abstract_text.trim(),
-    );
-
-    for topic in response
-        .results
-        .iter()
-        .chain(response.related_topics.iter())
-    {
-        push_topic_results(&mut results, topic);
-    }
+    let mut results = response
+        .web
+        .map(|web| web.results)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(search_result_from_brave)
+        .collect::<Vec<_>>();
 
     deduplicate_results(&mut results);
     results.truncate(limit);
@@ -164,41 +175,28 @@ fn parse_duckduckgo_results(
     }
 }
 
-fn push_topic_results(results: &mut Vec<SearchResult>, topic: &DuckDuckGoTopic) {
-    match topic {
-        DuckDuckGoTopic::Topic { text, first_url } => {
-            push_result(results, topic_title(text), first_url.trim(), text.trim());
-        }
-        DuckDuckGoTopic::Section { topics } => {
-            for topic in topics {
-                push_topic_results(results, topic);
-            }
-        }
-    }
-}
+fn search_result_from_brave(result: BraveSearchResult) -> Option<SearchResult> {
+    let title = result.title.trim();
+    let url = result.url.trim();
+    let snippet = brave_snippet(&result);
 
-fn push_result(results: &mut Vec<SearchResult>, title: &str, url: &str, snippet: &str) {
-    if url.is_empty() || snippet.is_empty() {
-        return;
+    if title.is_empty() || url.is_empty() || snippet.is_empty() {
+        return None;
     }
 
-    results.push(SearchResult {
-        title: fallback_title(title, snippet),
+    Some(SearchResult {
+        title: title.to_string(),
         url: url.to_string(),
-        snippet: snippet.to_string(),
-    });
+        snippet,
+    })
 }
 
-fn fallback_title(title: &str, snippet: &str) -> String {
-    if !title.is_empty() {
-        return title.to_string();
-    }
-
-    topic_title(snippet).to_string()
-}
-
-fn topic_title(text: &str) -> &str {
-    text.split(" - ").next().unwrap_or(text).trim()
+fn brave_snippet(result: &BraveSearchResult) -> String {
+    std::iter::once(result.description.trim())
+        .chain(result.extra_snippets.iter().map(|snippet| snippet.trim()))
+        .filter(|snippet| !snippet.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn deduplicate_results(results: &mut Vec<SearchResult>) {
@@ -223,6 +221,10 @@ fn ensure_success_status(status: StatusCode) -> Result<()> {
     Ok(())
 }
 
+fn is_default_brave_url(url: &str) -> bool {
+    url.trim_end_matches('/') == DEFAULT_WEB_SEARCH_URL
+}
+
 fn web_search_timeout() -> Duration {
     std::env::var("WEB_SEARCH_TIMEOUT_SECONDS")
         .ok()
@@ -237,32 +239,36 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_abstract_and_related_topics() {
-        let response: DuckDuckGoResponse = serde_json::from_str(
+    fn parses_brave_web_results() {
+        let response: BraveSearchResponse = serde_json::from_str(
             r#"{
-                "Heading": "Rust",
-                "AbstractText": "Rust is a programming language.",
-                "AbstractURL": "https://example.com/rust",
-                "Results": [],
-                "RelatedTopics": [
-                    {
-                        "Text": "Cargo - Rust package manager",
-                        "FirstURL": "https://example.com/cargo"
-                    },
-                    {
-                        "Topics": [
-                            {
-                                "Text": "Ratatui - terminal UI library",
-                                "FirstURL": "https://example.com/ratatui"
-                            }
-                        ]
-                    }
-                ]
+                "web": {
+                    "results": [
+                        {
+                            "title": "Rust",
+                            "url": "https://example.com/rust",
+                            "description": "Rust is a programming language.",
+                            "extra_snippets": [
+                                "Cargo is Rust's package manager."
+                            ]
+                        },
+                        {
+                            "title": "Rust duplicate",
+                            "url": "https://example.com/rust",
+                            "description": "Duplicate result."
+                        },
+                        {
+                            "title": "Ratatui",
+                            "url": "https://example.com/ratatui",
+                            "description": "Ratatui is a terminal UI library."
+                        }
+                    ]
+                }
             }"#,
         )
         .unwrap();
 
-        let results = parse_duckduckgo_results("rust", response, 3);
+        let results = parse_brave_results("rust", response, 3);
 
         assert_eq!(
             results.results,
@@ -270,17 +276,13 @@ mod tests {
                 SearchResult {
                     title: "Rust".to_string(),
                     url: "https://example.com/rust".to_string(),
-                    snippet: "Rust is a programming language.".to_string(),
-                },
-                SearchResult {
-                    title: "Cargo".to_string(),
-                    url: "https://example.com/cargo".to_string(),
-                    snippet: "Cargo - Rust package manager".to_string(),
+                    snippet: "Rust is a programming language. Cargo is Rust's package manager."
+                        .to_string(),
                 },
                 SearchResult {
                     title: "Ratatui".to_string(),
                     url: "https://example.com/ratatui".to_string(),
-                    snippet: "Ratatui - terminal UI library".to_string(),
+                    snippet: "Ratatui is a terminal UI library.".to_string(),
                 },
             ]
         );
@@ -297,5 +299,13 @@ mod tests {
             results.to_markdown(),
             "No web search results for `nothing`."
         );
+    }
+
+    #[test]
+    fn detects_default_brave_url_with_trailing_slash() {
+        assert!(is_default_brave_url(
+            "https://api.search.brave.com/res/v1/web/search/"
+        ));
+        assert!(!is_default_brave_url("https://example.com/search"));
     }
 }

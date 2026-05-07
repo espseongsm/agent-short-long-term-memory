@@ -4,18 +4,19 @@ This project is a Rust terminal agent for experimenting with short term and long
 
 Current scope:
 
-- Build a simple agent with Rig workflow messages and an OpenAI-compatible SDK for model calls.
+- Build a simple agent with Rig workflow messages and Rig's OpenAI-compatible provider for model calls.
 - Use a TUI as the agent interface.
 - Use Valkey as Redis-compatible short term memory.
 - Save chat history in Valkey with user id, session id, timestamp, role, and content.
 - Save the agent system prompt as YAML in a local `prompt/` folder.
 - Control LLM reasoning effort for latency when the provider supports it.
 - Automatically fetch current weather from a dedicated weather API for weather requests.
-- Automatically search the web for current or explicitly web-backed requests.
+- Automatically search the web through a full Brave Search API integration for current or explicitly web-backed requests.
 - Automatically amplify rough user requests when they are too vague to answer well.
 - Use pgvector as long term memory over local Markdown files.
 - Search saved chat history.
 - Keep daily development progress reports in Markdown.
+- Keep `src/main.rs` as the entry point and keep feature logic in small modules.
 
 ## What has been done
 
@@ -24,7 +25,7 @@ Current scope:
 - Added structured chat history entries with user id, session id, timestamp, and `user` or `assistant` roles.
 - Added generated runtime user ids and session ids for default runs.
 - Added local YAML archiving for the system prompt in `prompt/`.
-- Added conversion from saved chat entries into Rig workflow messages and OpenAI chat completion messages.
+- Added conversion from saved chat entries into Rig workflow messages.
 - Added case-insensitive chat history search.
 - Added a Ratatui-based terminal UI in `src/tui.rs`.
 - Added English/Korean Unicode input handling in the TUI prompt line.
@@ -32,7 +33,7 @@ Current scope:
 - Added basic Markdown rendering for conversation messages.
 - Added live TUI status and kept in-conversation LLM activity lines for model responses.
 - Added an Open-Meteo-backed current weather tool with automatic chat enrichment and CLI access.
-- Added a DuckDuckGo-compatible web search tool with automatic chat enrichment plus CLI and TUI access.
+- Added a Brave Search API-backed web search tool with automatic chat enrichment plus CLI and TUI access.
 - Added a request amplifier sub-agent with automatic vague-request enrichment plus CLI and TUI access.
 - Added optional LLM reasoning effort control for latency-sensitive runs.
 - Added mouse wheel scrolling for the TUI conversation pane.
@@ -42,9 +43,23 @@ Current scope:
 - Added a single-file daily development progress report in `daily-progress-report.md`.
 - Added GitHub Actions CI for formatting, tests, clippy, Valkey integration tests, and CLI help smoke checks.
 - Kept CLI subcommands in `src/main.rs` for utility and scripting workflows.
+- Moved automatic chat prompt enrichment into `src/agent_workflow.rs` so `src/main.rs` stays focused on CLI dispatch.
 - Kept local sensitive variables in `.env`, and ensured `.env` is ignored by git.
-- Added Rig Core, Async OpenAI, Tokio, Serde, Serde JSON, Redis, Reqwest, Clap, Anyhow, Thiserror, Ratatui, Crossterm, Arboard, Tokio Postgres, and Dotenvy dependencies.
+- Added Rig Core, Tokio, Serde, Serde JSON, Redis, Reqwest, Clap, Anyhow, Thiserror, Ratatui, Crossterm, Arboard, Tokio Postgres, and Dotenvy dependencies.
 - Started and verified a local Valkey Docker container named `valkey-memory`.
+
+## Code layout
+
+```text
+src/main.rs              CLI entry point and command dispatch
+src/tui.rs               Ratatui interface, input handling, and live status rendering
+src/agent_workflow.rs    Automatic routing, prompt enrichment, and workflow helpers
+src/llm.rs               Rig OpenAI-compatible model client and message shaping
+src/lib.rs               Valkey-backed short term memory and prompt YAML archiving
+src/long_term_memory.rs  pgvector Markdown indexing and search
+src/weather.rs           Open-Meteo current weather tool
+src/web_search.rs        Brave Search API web search tool
+```
 
 ## Architecture
 
@@ -64,7 +79,7 @@ TUI
 Rig workflow messages
  |
  v
-OpenAI-compatible SDK
+Rig OpenAI-compatible provider
  |
  v
 Qwen/Qwen3.6-35B-A3B
@@ -143,8 +158,8 @@ Start the terminal UI with explicit options:
 cargo run -- --user-id soonmo tui --session work --model Qwen/Qwen3.6-35B-A3B --reasoning-effort low
 ```
 
-The TUI loads recent chat history from Valkey, shapes the prompt flow as Rig workflow messages, sends the request through the OpenAI-compatible SDK, and stores the user and assistant messages back into Valkey.
-The TUI marks the status line as `Rust | Rig workflow + OpenAI SDK`.
+The TUI loads recent chat history from Valkey, shapes the prompt flow as Rig workflow messages, sends the request through Rig's OpenAI-compatible provider, and stores the user and assistant messages back into Valkey.
+The TUI marks the status line as `Rust | Rig OpenAI-compatible provider`.
 While a response is pending, the conversation pane shows an assistant activity line between the submitted user message and the final assistant response. The activity line is kept in the conversation pane after the response arrives, while Valkey stores only user and assistant chat messages. The status line also shows the model-call flow and elapsed wait time.
 Reasoning effort is optional and is not sent by default. Use `--reasoning-effort` or `LLM_REASONING_EFFORT` when the selected provider supports it. Inside the TUI, run `/reasoning <unset|none|minimal|low|medium|high|xhigh>` or `/effort <value>` to change the value for future model and amplifier calls in the current session.
 The conversation pane can be scrolled with Up/Down, PageUp/PageDown, Home, End, and the mouse wheel.
@@ -168,7 +183,8 @@ OPENAI_BASE_URL=...
 OPENAI_MODEL=Qwen/Qwen3.6-35B-A3B
 LLM_REASONING_EFFORT=low
 LLM_TIMEOUT_SECONDS=30
-WEB_SEARCH_URL=https://api.duckduckgo.com/
+BRAVE_SEARCH_API_KEY=...
+WEB_SEARCH_URL=https://api.search.brave.com/res/v1/web/search
 WEB_SEARCH_TIMEOUT_SECONDS=10
 WEATHER_GEOCODING_URL=http://geocoding-api.open-meteo.com/v1/search
 WEATHER_FORECAST_URL=http://api.open-meteo.com/v1/forecast
@@ -218,8 +234,8 @@ cargo run -- search hello --session work
 Search the web:
 
 ```sh
-cargo run -- web-search "latest Rust release"
-cargo run -- web-search "Valkey Redis fork" --limit 3
+BRAVE_SEARCH_API_KEY=... cargo run -- web-search "latest Rust release"
+BRAVE_SEARCH_API_KEY=... cargo run -- web-search "Valkey Redis fork" --limit 3
 ```
 
 Fetch current weather:
@@ -294,8 +310,9 @@ GitHub Actions runs `cargo fmt --check`, `cargo test`, `cargo clippy -- -D warni
 - OpenAI model: `Qwen/Qwen3.6-35B-A3B`
 - Reasoning effort: unset unless `--reasoning-effort` or `LLM_REASONING_EFFORT` is provided
 - Weather API: Open-Meteo geocoding and forecast endpoints
-- Web search URL: `https://api.duckduckgo.com/`
+- Web search URL: `https://api.search.brave.com/res/v1/web/search`
 - Web search limit: `5`
+- Web search API key: `BRAVE_SEARCH_API_KEY` or `WEB_SEARCH_API_KEY`
 - pgvector URL: unset by default; set `PGVECTOR_URL` to enable long term memory
 
 ## Verification
@@ -304,19 +321,13 @@ These checks passed:
 
 ```sh
 cargo fmt --check
-CARGO_TARGET_DIR=target/prd-check cargo test
-CARGO_TARGET_DIR=target/prd-check cargo clippy -- -D warnings
-CARGO_TARGET_DIR=target/prd-check cargo run --quiet -- --help
-CARGO_TARGET_DIR=target/prd-check cargo run --quiet -- tui --help
-CARGO_TARGET_DIR=target/prd-check cargo run --quiet -- chat --help
-CARGO_TARGET_DIR=target/prd-check cargo run --quiet -- weather --help
-CARGO_TARGET_DIR=target/prd-check cargo run --quiet -- web-search --help
-CARGO_TARGET_DIR=target/prd-check cargo run --quiet -- long-term-index --help
-CARGO_TARGET_DIR=target/prd-check cargo run --quiet -- long-term-search --help
-CARGO_TARGET_DIR=target/prd-check cargo run --quiet -- amplify --help
-CARGO_TARGET_DIR=target/prd-check cargo run --quiet -- weather Seoul
-CARGO_TARGET_DIR=target/prd-check cargo run --quiet -- web-search "Rust programming language" --limit 2
+CARGO_TARGET_DIR=target/codex-rig-search cargo test
+CARGO_TARGET_DIR=target/codex-rig-search cargo clippy -- -D warnings
+CARGO_TARGET_DIR=target/codex-rig-search cargo run --quiet -- --help
+CARGO_TARGET_DIR=target/codex-rig-search cargo run --quiet -- tui --help
+CARGO_TARGET_DIR=target/codex-rig-search cargo run --quiet -- web-search --help
+cargo tree | rg "async-openai|rig-core"
 git diff --check
 ```
 
-Live TUI, live pgvector indexing/search, and `chat` model calls require local services or provider credentials and have not been verified in this session.
+Live TUI, live pgvector indexing/search, Brave search requests, and `chat` model calls require local services or provider credentials and have not been verified in this session.
