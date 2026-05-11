@@ -114,7 +114,9 @@ pub async fn automatic_chat_prompt(
         }
     }
 
-    if let Some(long_term_context) = automatic_long_term_context(pgvector_url, prompt).await {
+    if actions.long_term_memory
+        && let Some(long_term_context) = automatic_long_term_context(pgvector_url, prompt).await
+    {
         prompt_for_llm = prompt_with_long_term_context(&prompt_for_llm, &long_term_context);
     }
 

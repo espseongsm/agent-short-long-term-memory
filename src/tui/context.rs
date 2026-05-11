@@ -217,7 +217,9 @@ pub(super) async fn prepare_automatic_chat_prompt(
         terminal.draw(|frame| render(frame, app, config))?;
     }
 
-    if let Some(pgvector_url) = config.pgvector_url.as_deref() {
+    if actions.long_term_memory
+        && let Some(pgvector_url) = config.pgvector_url.as_deref()
+    {
         let action_index = remember_agent_action(
             app,
             app.entries.len(),

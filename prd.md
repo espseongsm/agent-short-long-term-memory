@@ -39,7 +39,7 @@ TUI / chat CLI
  |     |   |-- weather-context correction -> new location weather
  |     |-- Brave web search
  |     |-- request amplifier sub-agent
- |     |-- pgvector Markdown memory
+ |     |-- pgvector Markdown memory for memory/notes requests
  |
  v
 Rig workflow messages
@@ -56,7 +56,7 @@ Valkey chat history
 
 ## 4. Current Repo Snapshot
 
-Status is based on the repo state on 2026-05-07.
+Status is based on the repo state on 2026-05-11.
 
 | Area | Status | Notes |
 | --- | --- | --- |
@@ -126,7 +126,7 @@ Valkey reference: <https://valkey.io/topics/>
 | LTM-1 | Use pgvector for long term memory. | Done |
 | LTM-2 | Use local Markdown files(`/Users/soonmoseong/Library/Mobile Documents/iCloud~md~obsidian/`) as the default data source. | Done |
 | LTM-3 | Provide CLI indexing and search commands. | Done |
-| LTM-4 | Add relevant long term memory context automatically when pgvector is available and Markdown data has been indexed. | Done |
+| LTM-4 | Add relevant long term memory context automatically for memory/notes requests when pgvector is available and Markdown data has been indexed. | Done |
 | LTM-5 | Require pgvector at app startup and fail clearly when it is unavailable. | Done |
 | LTM-6 | Make long term memory fully operational by default without manual pgvector Docker setup/indexing. | Planned |
 

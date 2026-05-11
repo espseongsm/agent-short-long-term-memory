@@ -7,7 +7,8 @@ mod weather_lookup;
 #[allow(unused_imports)]
 pub use actions::{
     AutomaticActions, automatic_actions, automatic_actions_for_chat, should_auto_amplify,
-    should_auto_summarize, should_auto_weather, should_auto_web_search,
+    should_auto_long_term_memory, should_auto_summarize, should_auto_weather,
+    should_auto_web_search,
 };
 #[allow(unused_imports)]
 pub use prompts::{

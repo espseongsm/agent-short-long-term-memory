@@ -9,6 +9,7 @@ pub struct AutomaticActions {
     pub amplify: bool,
     pub weather: bool,
     pub web_search: bool,
+    pub long_term_memory: bool,
 }
 
 pub fn automatic_actions(prompt: &str) -> AutomaticActions {
@@ -17,16 +18,20 @@ pub fn automatic_actions(prompt: &str) -> AutomaticActions {
             amplify: false,
             weather: false,
             web_search: false,
+            long_term_memory: false,
         };
     }
 
     let weather = should_auto_weather(prompt);
-    let web_search = !weather && should_auto_web_search(prompt);
+    let long_term_memory_candidate = should_auto_long_term_memory(prompt);
+    let web_search = !weather && !long_term_memory_candidate && should_auto_web_search(prompt);
+    let long_term_memory = !weather && !web_search && long_term_memory_candidate;
 
     AutomaticActions {
-        amplify: !weather && !web_search && should_auto_amplify(prompt),
+        amplify: !weather && !web_search && !long_term_memory && should_auto_amplify(prompt),
         weather,
         web_search,
+        long_term_memory,
     }
 }
 
@@ -40,6 +45,7 @@ pub fn automatic_actions_for_chat(history: &[ChatEntry], prompt: &str) -> Automa
         actions.amplify = false;
         actions.weather = true;
         actions.web_search = false;
+        actions.long_term_memory = false;
 
         return actions;
     }
@@ -49,6 +55,91 @@ pub fn automatic_actions_for_chat(history: &[ChatEntry], prompt: &str) -> Automa
     }
 
     actions
+}
+
+pub fn should_auto_long_term_memory(prompt: &str) -> bool {
+    let prompt = prompt.trim().to_lowercase();
+    if prompt.is_empty() || is_small_talk(&prompt) {
+        return false;
+    }
+
+    if contains_any(
+        &prompt,
+        &[
+            "long term memory",
+            "long-term memory",
+            "local markdown",
+            "markdown memory",
+            "장기 메모리",
+            "장기 기억",
+            "장기기억",
+            "롱텀 메모리",
+            "로컬 마크다운",
+        ],
+    ) {
+        return true;
+    }
+
+    let memory_targets = [
+        "my note",
+        "my notes",
+        "my memo",
+        "my memos",
+        "my journal",
+        "my diary",
+        "notes",
+        "memos",
+        "journals",
+        "diaries",
+        "obsidian",
+        "markdown",
+        "local memory",
+        "pgvector",
+        "내 메모",
+        "내 노트",
+        "내 기록",
+        "내 일기",
+        "나의 메모",
+        "나의 노트",
+        "메모",
+        "노트",
+        "기록",
+        "일기",
+        "옵시디언",
+        "마크다운",
+    ];
+    let retrieval_intents = [
+        "what",
+        "which",
+        "where",
+        "find",
+        "search",
+        "look up",
+        "lookup",
+        "recall",
+        "show",
+        "summarize",
+        "summary",
+        "about",
+        "say about",
+        "알려",
+        "찾",
+        "검색",
+        "조회",
+        "꺼내",
+        "요약",
+        "정리",
+        "뭐",
+        "무엇",
+        "어떤",
+        "어디",
+        "최근",
+        "요즘",
+        "관해",
+        "대해",
+    ];
+
+    contains_any(&prompt, &memory_targets) && contains_any(&prompt, &retrieval_intents)
 }
 
 pub fn should_auto_weather(prompt: &str) -> bool {
@@ -385,6 +476,7 @@ mod tests {
                 amplify: false,
                 weather: false,
                 web_search: true,
+                long_term_memory: false,
             }
         );
     }
@@ -397,6 +489,7 @@ mod tests {
                 amplify: false,
                 weather: false,
                 web_search: false,
+                long_term_memory: false,
             }
         );
     }
@@ -409,6 +502,7 @@ mod tests {
                 amplify: true,
                 weather: false,
                 web_search: false,
+                long_term_memory: false,
             }
         );
     }
@@ -421,6 +515,7 @@ mod tests {
                 amplify: false,
                 weather: false,
                 web_search: false,
+                long_term_memory: false,
             }
         );
     }
@@ -433,6 +528,7 @@ mod tests {
                 amplify: false,
                 weather: false,
                 web_search: false,
+                long_term_memory: false,
             }
         );
     }
@@ -445,6 +541,7 @@ mod tests {
                 amplify: false,
                 weather: false,
                 web_search: false,
+                long_term_memory: false,
             }
         );
         assert!(should_auto_summarize("sum up what we talked about"));
@@ -467,6 +564,7 @@ mod tests {
                 amplify: false,
                 weather: true,
                 web_search: false,
+                long_term_memory: false,
             }
         );
     }
@@ -481,6 +579,7 @@ mod tests {
                 amplify: false,
                 weather: true,
                 web_search: false,
+                long_term_memory: false,
             }
         );
         assert_eq!(
@@ -489,6 +588,7 @@ mod tests {
                 amplify: false,
                 weather: true,
                 web_search: false,
+                long_term_memory: false,
             }
         );
     }
@@ -503,6 +603,7 @@ mod tests {
                 amplify: false,
                 weather: false,
                 web_search: false,
+                long_term_memory: false,
             }
         );
     }
@@ -520,6 +621,7 @@ mod tests {
                 amplify: false,
                 weather: true,
                 web_search: false,
+                long_term_memory: false,
             }
         );
         assert_eq!(
@@ -528,7 +630,41 @@ mod tests {
                 amplify: false,
                 weather: true,
                 web_search: false,
+                long_term_memory: false,
             }
         );
+    }
+
+    #[test]
+    fn automatic_actions_search_long_term_memory_only_for_memory_requests() {
+        assert_eq!(
+            automatic_actions("내가 요즘 어떤 메모를 하고 있어?"),
+            AutomaticActions {
+                amplify: false,
+                weather: false,
+                web_search: false,
+                long_term_memory: true,
+            }
+        );
+        assert_eq!(
+            automatic_actions("search long-term memory for Valkey notes"),
+            AutomaticActions {
+                amplify: false,
+                weather: false,
+                web_search: false,
+                long_term_memory: true,
+            }
+        );
+        assert_eq!(
+            automatic_actions("what are my recent notes about Valkey?"),
+            AutomaticActions {
+                amplify: false,
+                weather: false,
+                web_search: false,
+                long_term_memory: true,
+            }
+        );
+        assert!(!should_auto_long_term_memory("remember to buy milk"));
+        assert!(!should_auto_long_term_memory("Explain ownership in Rust"));
     }
 }
