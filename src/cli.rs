@@ -15,7 +15,7 @@ const DEFAULT_VALKEY_URL: &str = "redis://127.0.0.1:6379/";
 const DEFAULT_PGVECTOR_URL: &str = "postgres://postgres:postgres@127.0.0.1:5432/agent_memory";
 const DEFAULT_NAMESPACE: &str = "agent:short-term";
 const DEFAULT_HISTORY_LIMIT: usize = 20;
-const DEFAULT_CHAT_TTL_SECONDS: u64 = 86_400;
+pub(crate) const DEFAULT_CHAT_TTL_SECONDS: u64 = 86_400;
 const DEFAULT_OPENAI_MODEL: &str = "gpt-5.5";
 const DEFAULT_LONG_TERM_MEMORY_PATH: &str =
     "/Users/soonmoseong/Library/Mobile Documents/iCloud~md~obsidian/";
@@ -131,6 +131,20 @@ pub(crate) enum Command {
     History {
         #[arg(long)]
         session: Option<String>,
+    },
+    Dashboard {
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+
+        #[arg(long, default_value_t = 120)]
+        preview_chars: usize,
+    },
+    DashboardServer {
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+
+        #[arg(long, default_value_t = 7878)]
+        port: u16,
     },
     Remember {
         key: String,
@@ -288,6 +302,35 @@ mod tests {
                 assert_eq!(path, PathBuf::from(DEFAULT_LONG_TERM_MEMORY_PATH));
             }
             _ => panic!("command should index long-term memory"),
+        }
+    }
+
+    #[test]
+    fn dashboard_uses_default_limits() {
+        let cli = Cli::try_parse_from(["agent_memory", "dashboard"]).unwrap();
+
+        match cli.command.unwrap() {
+            Command::Dashboard {
+                limit,
+                preview_chars,
+            } => {
+                assert_eq!(limit, 10);
+                assert_eq!(preview_chars, 120);
+            }
+            _ => panic!("command should open the dashboard"),
+        }
+    }
+
+    #[test]
+    fn dashboard_server_uses_localhost_by_default() {
+        let cli = Cli::try_parse_from(["agent_memory", "dashboard-server"]).unwrap();
+
+        match cli.command.unwrap() {
+            Command::DashboardServer { host, port } => {
+                assert_eq!(host, "127.0.0.1");
+                assert_eq!(port, 7878);
+            }
+            _ => panic!("command should open the web dashboard"),
         }
     }
 

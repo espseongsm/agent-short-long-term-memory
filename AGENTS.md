@@ -83,6 +83,11 @@ Strong success criteria let you loop independently. Weak criteria ("make it work
 
 - When pushing new feature development, please use a new branch.
 
+## 9. Coding convention
+
+- Any code file can't surpass 500 lines in a large margin.
+- Don't make similar functions for the same purpose.
+
 ---
 
 **These guidelines are working if:** fewer unnecessary changes in diffs, fewer rewrites due to overcomplication, and clarifying questions come before implementation rather than after mistakes.

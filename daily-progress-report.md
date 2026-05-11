@@ -23,8 +23,8 @@
 - `README 2.md`와 기존 README를 통합해 대문자 `README.md` 하나로 정리하고, Mermaid 런타임 흐름/모듈 맵/날씨 fallback 다이어그램을 포함한 최신 프로젝트 문서로 재구성했다.
 - pgvector 장기 메모리를 기본 로컬 URL로 설정하고, 일반 TUI/chat 시작 전에 pgvector 연결과 스키마 초기화를 검증해 서비스가 꺼져 있으면 명확히 실패하도록 했다.
 - `long-term-index`의 기본 Markdown 경로를 로컬 Obsidian/iCloud 메모리 위치로 맞추고, pgvector ranking을 보강하되 일반 질문이 아닌 long-term memory/메모/노트/Markdown 요청에서만 검색하도록 자동 라우팅을 좁혔다.
-- PRD의 long term memory 상태를 실제 구현에 맞춰 갱신하고, 완전 자동 Docker/bootstrap과 자동 indexing은 후속 계획으로 남겨 두었다.
-- `cargo fmt --check`, `cargo test`, `cargo clippy -- -D warnings`, `git diff --check`를 통과한 뒤 `codex/readme-architecture-visuals` 브랜치를 GitHub에 push하고 draft PR #7을 열었다.
+- Valkey에 저장된 chat session과 session-backed model token usage event를 SCAN으로 훑어 CLI와 `dashboard-server`에서 저장 대화와 토큰 사용량을 UTC 날짜/세션별로 보고, 웹에서는 날짜/세션/유저 header 우선순위를 바꿀 수 있게 했다.
+- `agent_workflow/actions`, `weather_locations`, `tui/render`를 책임별 하위 모듈로 더 나누고, `dashboard_timestamp` 중복 helper와 AGENTS.md 오타/빈 bullet, `hello what's the weather today?` 날씨 위치 추출 회귀를 정리했다.
 
 ### 검증
 
@@ -34,8 +34,13 @@ CARGO_TARGET_DIR=target/codex-rig-search cargo test
 CARGO_TARGET_DIR=target/codex-rig-search cargo clippy -- -D warnings
 CARGO_TARGET_DIR=target/codex-rig-search cargo run --quiet -- --help
 CARGO_TARGET_DIR=target/codex-rig-search cargo run --quiet -- tui --help
+CARGO_TARGET_DIR=target/codex-rig-search cargo run --quiet -- dashboard --help
+CARGO_TARGET_DIR=target/codex-rig-search cargo run --quiet -- dashboard-server --help
 CARGO_TARGET_DIR=target/codex-rig-search cargo run --quiet -- web-search --help
 CARGO_TARGET_DIR=target/codex-rig-search cargo run --quiet -- summary --help
+cargo run --quiet -- dashboard --limit 5 --preview-chars 80
+cargo run --quiet -- dashboard-server --port 7879
+cargo run --quiet -- weather "hello what's the weather today?" --reasoning-effort low
 cargo run --quiet -- weather "치앙마이 날씨는?" --reasoning-effort low
 cargo run --quiet -- chat "치앙마이 날씨는?" --reasoning-effort low
 cargo tree | rg "async-openai|rig-core"

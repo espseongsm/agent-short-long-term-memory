@@ -1,15 +1,25 @@
 use crate::{
-    llm::{LlmClient, ReasoningEffort},
+    llm::{LlmClient, ReasoningEffort, TokenUsage},
     long_term_memory,
     weather::WeatherClient,
     web_search::{DEFAULT_WEB_SEARCH_LIMIT, WebSearchClient},
 };
-use agent_memory::ChatEntry;
+use agent_memory::{ChatEntry, TokenUsageSource};
 
 use super::{
     actions::automatic_actions_for_chat, weather_locations::weather_location_query_for_chat,
-    weather_lookup::current_weather_with_translation_fallback,
+    weather_lookup::current_weather_with_translation_fallback_with_usage,
 };
+
+pub struct AutomaticChatPrompt {
+    pub prompt: String,
+    pub usage_events: Vec<AutomaticTokenUsage>,
+}
+
+pub struct AutomaticTokenUsage {
+    pub source: TokenUsageSource,
+    pub usage: TokenUsage,
+}
 
 pub fn prompt_with_amplification(original_prompt: &str, amplified_prompt: &str) -> String {
     format!(
@@ -35,6 +45,7 @@ pub fn prompt_with_long_term_context(prompt: &str, long_term_context: &str) -> S
     )
 }
 
+#[allow(dead_code)]
 pub async fn automatic_chat_prompt(
     pgvector_url: Option<&str>,
     history: &[ChatEntry],
@@ -44,16 +55,44 @@ pub async fn automatic_chat_prompt(
     amplifier_preamble: &str,
     weather_translator_preamble: &str,
 ) -> String {
+    automatic_chat_prompt_with_usage(
+        pgvector_url,
+        history,
+        prompt,
+        model,
+        reasoning_effort,
+        amplifier_preamble,
+        weather_translator_preamble,
+    )
+    .await
+    .prompt
+}
+
+pub async fn automatic_chat_prompt_with_usage(
+    pgvector_url: Option<&str>,
+    history: &[ChatEntry],
+    prompt: &str,
+    model: &str,
+    reasoning_effort: Option<ReasoningEffort>,
+    amplifier_preamble: &str,
+    weather_translator_preamble: &str,
+) -> AutomaticChatPrompt {
     let actions = automatic_actions_for_chat(history, prompt);
     let mut prompt_for_llm = prompt.to_string();
+    let mut usage_events = Vec::new();
 
     if actions.amplify {
         eprintln!("auto request amplifier: expanding vague request");
         match LlmClient::from_env(model.to_string(), amplifier_preamble, reasoning_effort) {
-            Ok(amplifier) => match amplifier.chat(history, prompt).await {
-                Ok(amplified) => {
+            Ok(amplifier) => match amplifier.chat_with_usage(history, prompt).await {
+                Ok(response) => {
                     eprintln!("auto request amplifier: produced amplified request");
-                    prompt_for_llm = prompt_with_amplification(prompt, &amplified);
+                    push_usage_event(
+                        &mut usage_events,
+                        TokenUsageSource::RequestAmplifier,
+                        response.usage,
+                    );
+                    prompt_for_llm = prompt_with_amplification(prompt, &response.text);
                 }
                 Err(error) => eprintln!("auto request amplifier failed: {error:#}"),
             },
@@ -69,7 +108,7 @@ pub async fn automatic_chat_prompt(
 
         match WeatherClient::from_env() {
             Ok(weather) => {
-                match current_weather_with_translation_fallback(
+                match current_weather_with_translation_fallback_with_usage(
                     &weather,
                     &location,
                     model,
@@ -78,8 +117,16 @@ pub async fn automatic_chat_prompt(
                 )
                 .await
                 {
-                    Ok(lookup) => {
-                        if let Some(translated_location) = &lookup.translated_location {
+                    Ok(result) => {
+                        if let Some(usage) = result.normalizer_usage {
+                            push_usage_event(
+                                &mut usage_events,
+                                TokenUsageSource::WeatherLocationNormalizer,
+                                usage,
+                            );
+                        }
+
+                        if let Some(translated_location) = &result.lookup.translated_location {
                             eprintln!(
                                 "auto weather: received current weather for translated location `{translated_location}`"
                             );
@@ -89,7 +136,7 @@ pub async fn automatic_chat_prompt(
 
                         prompt_for_llm = prompt_with_weather_context(
                             &prompt_for_llm,
-                            &lookup.report.to_markdown(),
+                            &result.lookup.report.to_markdown(),
                         );
                     }
                     Err(error) => eprintln!("auto weather failed: {error:#}"),
@@ -120,7 +167,20 @@ pub async fn automatic_chat_prompt(
         prompt_for_llm = prompt_with_long_term_context(&prompt_for_llm, &long_term_context);
     }
 
-    prompt_for_llm
+    AutomaticChatPrompt {
+        prompt: prompt_for_llm,
+        usage_events,
+    }
+}
+
+fn push_usage_event(
+    events: &mut Vec<AutomaticTokenUsage>,
+    source: TokenUsageSource,
+    usage: TokenUsage,
+) {
+    if usage.has_usage() {
+        events.push(AutomaticTokenUsage { source, usage });
+    }
 }
 
 async fn automatic_long_term_context(pgvector_url: Option<&str>, prompt: &str) -> Option<String> {

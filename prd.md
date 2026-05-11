@@ -31,11 +31,12 @@ TUI / chat CLI
  |-- user input
  |-- immediate local user message
  |-- prompt/*.yaml agent and sub-agent prompts
+ |-- Valkey chat dashboard command and local browser dashboard
  |-- automatic context routing
  |     |-- summary agent when the user asks to sum up the saved conversation
  |     |-- current weather
  |     |   |-- cleanup/alias -> Open-Meteo -> weather location normalizer -> Open-Meteo retry
- |     |   |-- missing location -> Seoul default
+ |     |   |-- missing location or greeting-only residue -> Seoul default
  |     |   |-- weather-context correction -> new location weather
  |     |-- Brave web search
  |     |-- request amplifier sub-agent
@@ -51,7 +52,7 @@ Rig OpenAI-compatible provider
 Assistant response
  |
  v
-Valkey chat history
+Valkey chat history and token usage events
 ```
 
 ## 4. Current Repo Snapshot
@@ -65,7 +66,7 @@ Status is based on the repo state on 2026-05-11.
 | Default model | Done | `gpt-5.5`. |
 | Short term memory | Done | Valkey stores chat history and simple key/value memory. |
 | Long term memory | Partial | pgvector is required at startup with a default local URL and `long-term-index` defaults to the local Markdown path, but full operation still requires a running pgvector database and indexed data. |
-| Weather context | Done | Open-Meteo current weather routing, CLI access, Korean aliases, and LLM location fallback. |
+| Weather context | Done | Open-Meteo current weather routing, CLI access, Korean aliases, LLM location fallback, pronoun follow-ups, correction handling, and greeting-residue guards. |
 | Web search context | Done | Brave Search API routing, CLI access, and TUI commands. |
 | Request amplifier | Done | Sub-agent expands vague requests automatically and by command. |
 | Summary agent | Done | Sub-agent summarizes saved chat sessions automatically and from CLI/TUI commands. |
@@ -116,6 +117,9 @@ Status is based on the repo state on 2026-05-11.
 | STM-3 | Support chat history search. | Done |
 | STM-4 | Generate fresh runtime user and session ids by default on each run. | Done |
 | STM-5 | Allow stable user and session ids for continuing known histories. | Done |
+| STM-6 | Provide a Valkey chat dashboard for scanning saved sessions and reading full saved conversations in a local browser. | Done |
+| STM-7 | Store session-backed model token usage events and show UTC usage grouped by date and session in the CLI and web dashboards. | Done |
+| STM-8 | Let the web dashboard reorder conversation detail headers by date, session, and user. | Done |
 
 Valkey reference: <https://valkey.io/topics/>
 
@@ -143,6 +147,7 @@ Valkey reference: <https://valkey.io/topics/>
 
 - Korean weather prompts and follow-ups such as `오늘 서울날씨는?`, `부산은?`, `뉴욕은?`, and `부에노스아이레스 날씨는?` normalize Korean domestic and foreign location names before calling the weather tool.
 - Location-free weather prompts such as `오늘 날씨는?` and `how's the weather today?` default to `Seoul` instead of sending question residue to the weather location normalizer.
+- Greeting-prefixed location-free weather prompts such as `hello what's the weather today?` strip small-talk residue and default to `Seoul` instead of geocoding `Hello` as a place name.
 - Pronoun weather follow-ups such as `how's the weather of it?` and `weather there?` resolve `it/there` from the most recent place discussed in chat before calling the weather tool.
 - Weather-context corrections such as `서울이 아니라... 난 지금 퀸즈야` and `I'm in Queens, not Seoul` are treated as weather requests for the corrected location before web search routing.
 - If deterministic cleanup/alias lookup cannot produce a geocodable location, the app sends only the extracted location name to a weather location normalizer, asks for one English place name, and retries Open-Meteo once.
@@ -165,14 +170,21 @@ Valkey reference: <https://valkey.io/topics/>
 - Keep `src/main.rs` focused on entry point and command dispatch.
 - Prefer small modules for feature behavior:
   - `src/cli.rs` for CLI definitions, defaults, and runtime ids.
+  - `src/dashboard.rs` for Valkey CLI/browser dashboard rendering and shared dashboard helpers.
+  - `src/usage.rs` for recording model token usage events from app flows.
   - `src/tui.rs` and `src/tui/` for TUI behavior.
+  - `src/tui/render.rs` and `src/tui/render/` for Ratatui rendering and render tests/helpers.
   - `src/agent_workflow.rs` and `src/agent_workflow/` for automatic routing and prompt enrichment.
+  - `src/agent_workflow/actions.rs` and `src/agent_workflow/actions/` for automatic routing decisions.
+  - `src/agent_workflow/weather_locations.rs` and `src/agent_workflow/weather_locations/` for weather location extraction, aliases, and tests.
   - `src/llm.rs` for Rig model calls.
   - `src/lib.rs` for Valkey-backed short term memory.
+  - `src/token_usage.rs` for Valkey token usage records and UTC daily aggregation.
   - `src/long_term_memory.rs` for pgvector Markdown memory.
   - `src/weather.rs` for weather lookup.
   - `src/web_search.rs` for Brave Search API integration.
 - Avoid speculative abstractions until repeated behavior needs them.
+- Avoid duplicate single-purpose helper functions; share helpers when CLI and web dashboard behavior match.
 - Keep sensitive local settings in `.env`, not in git.
 
 ## 7. Follow-Up Checklist
@@ -192,6 +204,8 @@ cargo fmt --check
 cargo test
 cargo clippy -- -D warnings
 git diff --check
+cargo run --quiet -- dashboard --limit 5 --preview-chars 80
+cargo run --quiet -- weather "hello what's the weather today?" --reasoning-effort low
 ```
 
 ## 9. Readme

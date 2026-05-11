@@ -2,6 +2,7 @@ use crate::llm::{LlmClient, LlmResponse, ReasoningEffort};
 use agent_memory::ChatEntry;
 use anyhow::{Context, Result};
 
+#[allow(dead_code)]
 pub async fn summarize_chat_history(
     history: &[ChatEntry],
     model: String,
