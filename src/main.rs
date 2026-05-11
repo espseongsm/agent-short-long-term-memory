@@ -1,14 +1,17 @@
 use agent_memory::{
-    ChatEntry, ChatRole, DEFAULT_PROMPT_DIR, ShortTermMemory, save_system_prompt_yaml,
+    ChatEntry, ChatRole, DEFAULT_PROMPT_DIR, ShortTermMemory, TokenUsageSource,
+    save_system_prompt_yaml,
 };
 use anyhow::{Context, Result, ensure};
 use clap::Parser;
 
 mod agent_workflow;
 mod cli;
+mod dashboard;
 mod llm;
 mod long_term_memory;
 mod tui;
+mod usage;
 mod weather;
 mod web_search;
 
@@ -51,6 +54,19 @@ async fn main() -> Result<()> {
                 *history_limit > 0,
                 "history_limit must be greater than zero"
             );
+        }
+        Command::Dashboard {
+            limit,
+            preview_chars,
+        } => {
+            ensure!(*limit > 0, "limit must be greater than zero");
+            ensure!(
+                *preview_chars > 0,
+                "preview_chars must be greater than zero"
+            );
+        }
+        Command::DashboardServer { port, .. } => {
+            ensure!(*port > 0, "port must be greater than zero");
         }
         Command::WebSearch { limit, .. } => {
             ensure!(*limit > 0, "limit must be greater than zero");
@@ -148,8 +164,37 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    if let Command::DashboardServer { host, port } = &command {
+        dashboard::run(dashboard::DashboardServerConfig {
+            valkey_url: cli.valkey_url.clone(),
+            namespace: cli.namespace.clone(),
+            host: host.clone(),
+            port: *port,
+        })?;
+        return Ok(());
+    }
+
     let mut memory = ShortTermMemory::connect(&cli.valkey_url, &cli.namespace)
         .with_context(|| format!("failed to connect to Valkey at {}", cli.valkey_url))?;
+
+    if let Command::Dashboard {
+        limit,
+        preview_chars,
+    } = &command
+    {
+        let summaries = memory
+            .chat_session_summaries(*limit)
+            .context("failed to read Valkey chat dashboard")?;
+        let daily_usage = memory
+            .daily_token_usage()
+            .context("failed to read Valkey token usage dashboard")?;
+        print!(
+            "{}",
+            dashboard::render_cli_dashboard(&summaries, &daily_usage, *preview_chars)
+        );
+        return Ok(());
+    }
+
     verify_long_term_memory(&cli.pgvector_url).await?;
 
     match command {
@@ -201,13 +246,23 @@ async fn main() -> Result<()> {
                 let response = if history.is_empty() {
                     "No saved chat history to summarize yet.".to_string()
                 } else {
-                    agent_workflow::summarize_chat_history(
+                    let response = agent_workflow::summarize_chat_history_with_usage(
                         &history,
                         model,
                         reasoning_effort,
                         &prompts.summary_agent,
                     )
-                    .await?
+                    .await?;
+                    usage::record_token_usage(
+                        &mut memory,
+                        &user_id,
+                        &session,
+                        TokenUsageSource::SummaryAgent,
+                        response.usage,
+                        ttl_seconds,
+                    )
+                    .context("failed to save summary token usage")?;
+                    response.text
                 };
 
                 memory
@@ -226,7 +281,7 @@ async fn main() -> Result<()> {
                 return Ok(());
             }
 
-            let prompt_for_llm = agent_workflow::automatic_chat_prompt(
+            let prepared_prompt = agent_workflow::automatic_chat_prompt_with_usage(
                 Some(cli.pgvector_url.as_str()),
                 &history,
                 &user_entry.content,
@@ -236,12 +291,28 @@ async fn main() -> Result<()> {
                 &prompts.weather_location_normalizer,
             )
             .await;
+            record_automatic_token_usage(
+                &mut memory,
+                &user_id,
+                &session,
+                ttl_seconds,
+                prepared_prompt.usage_events,
+            )?;
             let llm = llm::LlmClient::from_env(model, prompts.agent.clone(), reasoning_effort)
                 .context("failed to init LLM client")?;
             let response = llm
-                .chat(&history, &prompt_for_llm)
+                .chat_with_usage(&history, &prepared_prompt.prompt)
                 .await
                 .context("failed to run agent chat")?;
+            usage::record_token_usage(
+                &mut memory,
+                &user_id,
+                &session,
+                TokenUsageSource::FinalAnswer,
+                response.usage,
+                ttl_seconds,
+            )
+            .context("failed to save final answer token usage")?;
 
             memory
                 .append_chat_entry(&session, user_entry, history_limit, ttl_seconds)
@@ -249,13 +320,13 @@ async fn main() -> Result<()> {
             memory
                 .append_chat_entry(
                     &session,
-                    ChatEntry::for_session(&user_id, &session, ChatRole::Assistant, &response),
+                    ChatEntry::for_session(&user_id, &session, ChatRole::Assistant, &response.text),
                     history_limit,
                     ttl_seconds,
                 )
                 .context("failed to save assistant chat history")?;
 
-            println!("{response}");
+            println!("{}", response.text);
         }
         Command::History { session } => {
             let session = session.unwrap_or_else(|| runtime_id("session"));
@@ -303,15 +374,24 @@ async fn main() -> Result<()> {
             if history.is_empty() {
                 println!("not found");
             } else {
-                let summary = agent_workflow::summarize_chat_history(
+                let summary = agent_workflow::summarize_chat_history_with_usage(
                     &history,
                     model,
                     reasoning_effort,
                     &prompts.summary_agent,
                 )
                 .await?;
+                usage::record_token_usage(
+                    &mut memory,
+                    &user_id,
+                    &session,
+                    TokenUsageSource::SummaryAgent,
+                    summary.usage,
+                    cli::DEFAULT_CHAT_TTL_SECONDS,
+                )
+                .context("failed to save summary token usage")?;
 
-                println!("{summary}");
+                println!("{}", summary.text);
             }
         }
         Command::WebSearch { .. } => unreachable!("web search is handled before Valkey connects"),
@@ -323,6 +403,10 @@ async fn main() -> Result<()> {
             unreachable!("long-term search is handled before Valkey connects")
         }
         Command::Amplify { .. } => unreachable!("amplify is handled before Valkey connects"),
+        Command::Dashboard { .. } => unreachable!("dashboard is handled before pgvector connects"),
+        Command::DashboardServer { .. } => {
+            unreachable!("dashboard server is handled before Valkey connects")
+        }
         Command::Forget { key } => {
             let removed = memory
                 .forget(&key)
@@ -386,4 +470,26 @@ fn chat_entry_metadata(entry: &ChatEntry) -> String {
 
 fn fallback_metadata(value: &str) -> &str {
     if value.is_empty() { "unknown" } else { value }
+}
+
+fn record_automatic_token_usage(
+    memory: &mut ShortTermMemory,
+    user_id: &str,
+    session: &str,
+    ttl_seconds: u64,
+    usage_events: Vec<agent_workflow::AutomaticTokenUsage>,
+) -> Result<()> {
+    for event in usage_events {
+        usage::record_token_usage(
+            memory,
+            user_id,
+            session,
+            event.source,
+            event.usage,
+            ttl_seconds,
+        )
+        .context("failed to save automatic token usage")?;
+    }
+
+    Ok(())
 }

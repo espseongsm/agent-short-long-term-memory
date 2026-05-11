@@ -3,8 +3,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::{agent_workflow, llm::LlmClient, weather::WeatherClient, web_search::WebSearchClient};
-use agent_memory::{ChatEntry, ChatRole, ShortTermMemory};
+use crate::{
+    agent_workflow, llm::LlmClient, usage, weather::WeatherClient, web_search::WebSearchClient,
+};
+use agent_memory::{ChatEntry, ChatRole, ShortTermMemory, TokenUsageSource};
 use anyhow::{Context, Result};
 use crossterm::{
     event::{
@@ -297,7 +299,7 @@ async fn run_app(
                         }
 
                         let prompt_for_llm = match prepare_automatic_chat_prompt(
-                            terminal, services, config, app, &history, &prompt,
+                            terminal, memory, services, config, app, &history, &prompt,
                         )
                         .await
                         {
@@ -414,6 +416,15 @@ async fn finish_pending_response(
         ),
     );
     app.token_usage.add(response.usage);
+    usage::record_token_usage(
+        memory,
+        &config.user_id,
+        &config.session,
+        TokenUsageSource::FinalAnswer,
+        response.usage,
+        config.ttl_seconds,
+    )
+    .context("failed to save final answer token usage")?;
 
     let assistant_entry = ChatEntry::for_session(
         &config.user_id,

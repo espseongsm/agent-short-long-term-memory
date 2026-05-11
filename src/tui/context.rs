@@ -1,7 +1,7 @@
 use crate::{
-    agent_workflow, llm::LlmClient, long_term_memory, web_search::DEFAULT_WEB_SEARCH_LIMIT,
+    agent_workflow, llm::LlmClient, long_term_memory, usage, web_search::DEFAULT_WEB_SEARCH_LIMIT,
 };
-use agent_memory::ChatEntry;
+use agent_memory::{ChatEntry, ShortTermMemory, TokenUsageSource};
 use anyhow::Result;
 use ratatui::DefaultTerminal;
 
@@ -12,6 +12,7 @@ use super::{
 
 pub(super) async fn prepare_automatic_chat_prompt(
     terminal: &mut DefaultTerminal,
+    memory: &mut ShortTermMemory,
     services: AgentServices<'_>,
     config: &TuiConfig,
     app: &mut App,
@@ -40,6 +41,14 @@ pub(super) async fn prepare_automatic_chat_prompt(
             {
                 Ok(response) => {
                     app.token_usage.add(response.usage);
+                    usage::record_token_usage(
+                        memory,
+                        &config.user_id,
+                        &config.session,
+                        TokenUsageSource::RequestAmplifier,
+                        response.usage,
+                        config.ttl_seconds,
+                    )?;
                     set_agent_action(
                         app,
                         action_index,
@@ -104,7 +113,7 @@ pub(super) async fn prepare_automatic_chat_prompt(
                     "weather: direct lookup failed; translating location for geocoding".to_string();
                 terminal.draw(|frame| render(frame, app, config))?;
 
-                match agent_workflow::translate_weather_location_to_english(
+                match agent_workflow::translate_weather_location_to_english_with_usage(
                     &location,
                     &config.model,
                     app.reasoning_effort,
@@ -112,53 +121,68 @@ pub(super) async fn prepare_automatic_chat_prompt(
                 )
                 .await
                 {
-                    Ok(Some(translated_location)) => {
-                        set_agent_action(
-                            app,
-                            action_index,
-                            format!(
-                                "weather: retrying current conditions for `{translated_location}`"
-                            ),
-                        );
-                        app.status = format!(
-                            "weather: retrying current conditions for `{translated_location}`"
-                        );
-                        terminal.draw(|frame| render(frame, app, config))?;
-
-                        match services.weather.current_weather(&translated_location).await {
-                            Ok(report) => {
-                                set_agent_action(
-                                    app,
-                                    action_index,
-                                    "weather: added automatic current weather context via translated location"
-                                        .to_string(),
-                                );
-                                prompt_for_llm = agent_workflow::prompt_with_weather_context(
-                                    &prompt_for_llm,
-                                    &report.to_markdown(),
-                                );
-                            }
-                            Err(error) => {
-                                set_agent_action(
-                                    app,
-                                    action_index,
-                                    "weather: automatic request failed; continuing without weather context"
-                                        .to_string(),
-                                );
-                                app.status = format_error_chain(&error.context(format!(
-                                    "translated weather lookup for `{translated_location}` failed"
-                                )));
-                            }
+                    Ok(translation) => {
+                        if let Some(usage) =
+                            translation.usage.has_usage().then_some(translation.usage)
+                        {
+                            usage::record_token_usage(
+                                memory,
+                                &config.user_id,
+                                &config.session,
+                                TokenUsageSource::WeatherLocationNormalizer,
+                                usage,
+                                config.ttl_seconds,
+                            )?;
                         }
-                    }
-                    Ok(None) => {
-                        set_agent_action(
-                            app,
-                            action_index,
-                            "weather: automatic request failed; continuing without weather context"
-                                .to_string(),
-                        );
-                        app.status = format_error_chain(&error);
+
+                        if let Some(translated_location) = translation.location {
+                            set_agent_action(
+                                app,
+                                action_index,
+                                format!(
+                                    "weather: retrying current conditions for `{translated_location}`"
+                                ),
+                            );
+                            app.status = format!(
+                                "weather: retrying current conditions for `{translated_location}`"
+                            );
+                            terminal.draw(|frame| render(frame, app, config))?;
+
+                            match services.weather.current_weather(&translated_location).await {
+                                Ok(report) => {
+                                    set_agent_action(
+                                        app,
+                                        action_index,
+                                        "weather: added automatic current weather context via translated location"
+                                            .to_string(),
+                                    );
+                                    prompt_for_llm = agent_workflow::prompt_with_weather_context(
+                                        &prompt_for_llm,
+                                        &report.to_markdown(),
+                                    );
+                                }
+                                Err(error) => {
+                                    set_agent_action(
+                                        app,
+                                        action_index,
+                                        "weather: automatic request failed; continuing without weather context"
+                                            .to_string(),
+                                    );
+                                    app.status = format_error_chain(&error.context(format!(
+                                        "translated weather lookup for `{translated_location}` failed"
+                                    )));
+                                }
+                            }
+                        } else {
+                            set_agent_action(
+                                app,
+                                action_index,
+                                "weather: automatic request failed; continuing without weather context"
+                                    .to_string(),
+                            );
+                            app.status = format_error_chain(&error);
+                            terminal.draw(|frame| render(frame, app, config))?;
+                        }
                     }
                     Err(error) => {
                         set_agent_action(

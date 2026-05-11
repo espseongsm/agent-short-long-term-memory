@@ -1,5 +1,11 @@
 use agent_memory::{ChatEntry, ChatRole};
 
+mod aliases;
+#[cfg(test)]
+mod tests;
+
+use aliases::weather_location_alias;
+
 const WEATHER_PRONOUN_LOCATIONS: &[&str] = &[
     "it",
     "of it",
@@ -370,9 +376,18 @@ fn is_non_location_weather_residue(location: &str) -> bool {
                 | "how"
                 | "how is"
                 | "how's"
+                | "hello"
+                | "hello there"
+                | "hi"
+                | "hey"
+                | "good morning"
+                | "good afternoon"
+                | "good evening"
                 | "what"
                 | "what is"
                 | "what's"
+                | "안녕"
+                | "안녕하세요"
                 | "은"
                 | "는"
                 | "이"
@@ -383,11 +398,28 @@ fn is_non_location_weather_residue(location: &str) -> bool {
 }
 
 fn strip_leading_weather_location_noise(location: &str) -> &str {
+    for prefix in [
+        "hello there",
+        "good morning",
+        "good afternoon",
+        "good evening",
+    ] {
+        if location.to_lowercase().starts_with(prefix) {
+            let rest = location[prefix.len()..].trim_start();
+            if !rest.is_empty() {
+                return rest;
+            }
+        }
+    }
+
     let Some((first, rest)) = location.split_once(' ') else {
         return location;
     };
 
-    if matches!(first.to_lowercase().as_str(), "in" | "for" | "at" | "of") {
+    if matches!(
+        first.to_lowercase().as_str(),
+        "in" | "for" | "at" | "of" | "hello" | "hi" | "hey" | "안녕" | "안녕하세요"
+    ) {
         rest.trim_start()
     } else {
         location
@@ -406,154 +438,6 @@ fn strip_trailing_weather_location_noise(location: &str) -> &str {
         rest.trim_end()
     } else {
         location
-    }
-}
-
-fn weather_location_alias(location: &str) -> &str {
-    match location {
-        "서울" | "서울시" | "서울특별시" => "Seoul",
-        "부산" | "부산시" | "부산광역시" => "Busan",
-        "인천" | "인천시" | "인천광역시" => "Incheon",
-        "대구" | "대구시" | "대구광역시" => "Daegu",
-        "대전" | "대전시" | "대전광역시" => "Daejeon",
-        "광주" | "광주시" | "광주광역시" => "Gwangju",
-        "울산" | "울산시" | "울산광역시" => "Ulsan",
-        "세종" | "세종시" | "세종특별자치시" => "Sejong",
-        "제주" | "제주시" => "Jeju City",
-        "서귀포" | "서귀포시" => "Seogwipo",
-        "수원" | "수원시" => "Suwon",
-        "성남" | "성남시" => "Seongnam",
-        "용인" | "용인시" => "Yongin",
-        "고양" | "고양시" => "Goyang",
-        "창원" | "창원시" => "Changwon",
-        "청주" | "청주시" => "Cheongju",
-        "전주" | "전주시" => "Jeonju",
-        "천안" | "천안시" => "Cheonan",
-        "포항" | "포항시" => "Pohang",
-        "춘천" | "춘천시" => "Chuncheon",
-        "강릉" | "강릉시" => "Gangneung",
-        "뉴욕" | "뉴욕시" => "New York",
-        "퀸즈" | "퀸즈구" => "Queens",
-        "워싱턴" | "워싱턴디씨" | "워싱턴 dc" | "워싱턴 d.c." => "Washington DC",
-        "로스앤젤레스" | "엘에이" | "la" => "Los Angeles",
-        "샌프란시스코" => "San Francisco",
-        "시카고" => "Chicago",
-        "라스베이거스" | "라스베가스" => "Las Vegas",
-        "런던" => "London",
-        "파리" => "Paris",
-        "베를린" => "Berlin",
-        "로마" => "Rome",
-        "마드리드" => "Madrid",
-        "바르셀로나" => "Barcelona",
-        "리스본" => "Lisbon",
-        "암스테르담" => "Amsterdam",
-        "브뤼셀" => "Brussels",
-        "빈" | "비엔나" => "Vienna",
-        "취리히" => "Zurich",
-        "제네바" => "Geneva",
-        "프라하" => "Prague",
-        "부다페스트" => "Budapest",
-        "바르샤바" => "Warsaw",
-        "코펜하겐" => "Copenhagen",
-        "스톡홀름" => "Stockholm",
-        "오슬로" => "Oslo",
-        "헬싱키" => "Helsinki",
-        "더블린" => "Dublin",
-        "모스크바" => "Moscow",
-        "이스탄불" => "Istanbul",
-        "두바이" => "Dubai",
-        "아부다비" => "Abu Dhabi",
-        "도하" => "Doha",
-        "리야드" => "Riyadh",
-        "카이로" => "Cairo",
-        "케이프타운" => "Cape Town",
-        "요하네스버그" => "Johannesburg",
-        "나이로비" => "Nairobi",
-        "방콕" => "Bangkok",
-        "하노이" => "Hanoi",
-        "호치민" | "호찌민" => "Ho Chi Minh City",
-        "싱가포르" => "Singapore",
-        "쿠알라룸푸르" => "Kuala Lumpur",
-        "자카르타" => "Jakarta",
-        "마닐라" => "Manila",
-        "타이베이" | "타이페이" => "Taipei",
-        "홍콩" => "Hong Kong",
-        "마카오" => "Macau",
-        "베이징" | "북경" => "Beijing",
-        "상하이" | "상해" => "Shanghai",
-        "광저우" => "Guangzhou",
-        "선전" | "심천" => "Shenzhen",
-        "도쿄" | "동경" => "Tokyo",
-        "오사카" => "Osaka",
-        "교토" => "Kyoto",
-        "후쿠오카" => "Fukuoka",
-        "삿포로" => "Sapporo",
-        "나고야" => "Nagoya",
-        "오키나와" | "나하" => "Naha",
-        "시드니" => "Sydney",
-        "멜버른" | "멜번" => "Melbourne",
-        "브리즈번" => "Brisbane",
-        "퍼스" => "Perth",
-        "오클랜드" => "Auckland",
-        "웰링턴" => "Wellington",
-        "토론토" => "Toronto",
-        "밴쿠버" => "Vancouver",
-        "몬트리올" => "Montreal",
-        "멕시코시티" => "Mexico City",
-        "칸쿤" => "Cancun",
-        "리마" => "Lima",
-        "보고타" => "Bogota",
-        "산티아고" => "Santiago",
-        "상파울루" | "상파울로" => "Sao Paulo",
-        "리우데자네이루" => "Rio de Janeiro",
-        "부에노스아이레스" => "Buenos Aires",
-        "멘도사" => "Mendoza",
-        "코르도바" => "Cordoba",
-        "우수아이아" => "Ushuaia",
-        "미국" => "Washington DC",
-        "캐나다" => "Ottawa",
-        "영국" => "London",
-        "프랑스" => "Paris",
-        "독일" => "Berlin",
-        "이탈리아" => "Rome",
-        "스페인" => "Madrid",
-        "포르투갈" => "Lisbon",
-        "네덜란드" => "Amsterdam",
-        "벨기에" => "Brussels",
-        "스위스" => "Bern",
-        "오스트리아" => "Vienna",
-        "체코" => "Prague",
-        "헝가리" => "Budapest",
-        "폴란드" => "Warsaw",
-        "덴마크" => "Copenhagen",
-        "스웨덴" => "Stockholm",
-        "노르웨이" => "Oslo",
-        "핀란드" => "Helsinki",
-        "아일랜드" => "Dublin",
-        "러시아" => "Moscow",
-        "튀르키예" | "터키" => "Ankara",
-        "일본" => "Tokyo",
-        "중국" => "Beijing",
-        "대만" => "Taipei",
-        "태국" => "Bangkok",
-        "베트남" => "Hanoi",
-        "말레이시아" => "Kuala Lumpur",
-        "인도네시아" => "Jakarta",
-        "필리핀" => "Manila",
-        "호주" | "오스트레일리아" => "Canberra",
-        "뉴질랜드" => "Wellington",
-        "멕시코" => "Mexico City",
-        "브라질" => "Brasilia",
-        "아르헨티나" => "Buenos Aires",
-        "칠레" => "Santiago",
-        "페루" => "Lima",
-        "콜롬비아" => "Bogota",
-        "남아공" | "남아프리카공화국" => "Pretoria",
-        "이집트" => "Cairo",
-        "케냐" => "Nairobi",
-        "아랍에미리트" | "아랍에미리트연합" => "Abu Dhabi",
-        "사우디아라비아" => "Riyadh",
-        _ => location,
     }
 }
 
@@ -618,79 +502,4 @@ pub(super) fn is_boundary_punctuation(character: char) -> bool {
         character,
         '?' | '!' | '.' | ',' | ':' | ';' | '"' | '\'' | '`' | '“' | '”'
     )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use agent_memory::{ChatEntry, ChatRole};
-
-    #[test]
-    fn extracts_weather_locations() {
-        assert_eq!(weather_location_query("Seoul current weather"), "Seoul");
-        assert_eq!(weather_location_query("weather in Seoul"), "Seoul");
-        assert_eq!(
-            weather_location_query("what's the weather today in seoul?"),
-            "seoul"
-        );
-        assert_eq!(
-            weather_location_query("What's the weather in Seoul today?"),
-            "Seoul"
-        );
-        assert_eq!(
-            weather_location_query("weather in The Hague today"),
-            "The Hague"
-        );
-        assert_eq!(weather_location_query("오늘 서울날씨는?"), "Seoul");
-        assert_eq!(weather_location_query("부산은?"), "Busan");
-        assert_eq!(weather_location_query("그럼 부산은?"), "Busan");
-        assert_eq!(weather_location_query("what about Busan?"), "Busan");
-        assert_eq!(weather_location_query("치앙마이 날씨는?"), "치앙마이");
-        assert_eq!(weather_location_query("오늘 날씨는?"), "Seoul");
-        assert_eq!(weather_location_query("how's the weather today?"), "Seoul");
-        assert_eq!(
-            weather_location_query("서울이 아니라... 난 지금 퀸즈야"),
-            "Queens"
-        );
-        assert_eq!(weather_location_query("I'm in Queens, not Seoul"), "Queens");
-        assert_eq!(
-            weather_location_query("What is Seoul's current weather?"),
-            "Seoul"
-        );
-        assert_eq!(weather_location_query("서울 현재 날씨"), "Seoul");
-    }
-
-    #[test]
-    fn resolves_pronoun_weather_locations_from_recent_place_context() {
-        let history = vec![
-            ChatEntry::new(ChatRole::User, "okay. please let me know staten island"),
-            ChatEntry::new(
-                ChatRole::Assistant,
-                "Staten Island is one of the five boroughs of New York City.",
-            ),
-        ];
-
-        assert_eq!(
-            weather_location_query_for_chat(&history, "how's the weather of it?"),
-            "Staten Island"
-        );
-        assert_eq!(
-            weather_location_query_for_chat(&history, "weather there?"),
-            "Staten Island"
-        );
-    }
-
-    #[test]
-    fn maps_common_korean_weather_locations_to_open_meteo_names() {
-        assert_eq!(weather_location_query("인천 날씨"), "Incheon");
-        assert_eq!(weather_location_query("대전은?"), "Daejeon");
-        assert_eq!(weather_location_query("제주시 날씨"), "Jeju City");
-        assert_eq!(
-            weather_location_query("부에노스아이레스 날씨는?"),
-            "Buenos Aires"
-        );
-        assert_eq!(weather_location_query("뉴욕은?"), "New York");
-        assert_eq!(weather_location_query("퀸즈는?"), "Queens");
-        assert_eq!(weather_location_query("아르헨티나 날씨는?"), "Buenos Aires");
-    }
 }

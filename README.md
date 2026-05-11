@@ -11,6 +11,11 @@ long term memory, and Rig's OpenAI-compatible provider path.
 - Runs a TUI-first chat agent with English and Korean input.
 - Stores short term chat history in Valkey with user id, session id, timestamp,
   role, and content.
+- Provides Valkey chat dashboards for scanning sessions in the CLI and reading
+  full conversations in a local browser.
+- Shows UTC daily token usage grouped by date and session in both Valkey
+  dashboards for session-backed model calls.
+- Lets the web dashboard reorder conversation headers by date, session, and user.
 - Indexes local Markdown files into pgvector for long term memory.
 - Calls Rig workflow messages through an OpenAI-compatible model provider.
 - Routes useful context automatically before the final answer:
@@ -19,6 +24,9 @@ long term memory, and Rig's OpenAI-compatible provider path.
   - vague request amplification through a sub-agent
   - saved conversation summaries through a summary sub-agent
   - local Markdown long term memory through pgvector for memory/notes requests
+- Defaults location-free weather prompts, including greeting-prefixed prompts
+  like `hello what's the weather today?`, to Seoul instead of treating greeting
+  words as place names.
 - Keeps agent and sub-agent prompts in `prompt/*.yaml`.
 - Shows model activity, elapsed time, session token usage, and a Rust + Rig
   runtime banner in the TUI.
@@ -62,6 +70,8 @@ cargo run -- --user-id soonmo tui --session work --model gpt-5.5 --reasoning-eff
 ```mermaid
 flowchart TD
     User[User] --> Interface{TUI or chat CLI}
+    User --> DashboardCli[dashboard CLI]
+    User --> DashboardWeb[dashboard-server browser UI]
     Interface --> LocalEcho[Show user message immediately]
     LocalEcho --> Router[agent_workflow automatic router]
 
@@ -88,8 +98,12 @@ flowchart TD
     RigMessages --> Provider[Rig OpenAI-compatible provider]
     Provider --> Model[Configured model]
     Model --> Assistant[Assistant response plus token usage]
-    Assistant --> Valkey[(Valkey chat history)]
+    Assistant --> Valkey[(Valkey chat history and token usage)]
     Assistant --> Interface
+    DashboardCli --> Valkey
+    Valkey --> DashboardCli
+    DashboardWeb --> Valkey
+    Valkey --> DashboardWeb
 ```
 
 ### Module Map
@@ -97,6 +111,7 @@ flowchart TD
 ```mermaid
 flowchart LR
     main[src/main.rs] --> cli[src/cli.rs]
+    main --> dashboard[src/dashboard.rs]
     main --> tuiFacade[src/tui.rs]
     main --> workflowFacade[src/agent_workflow.rs]
     main --> memory[src/lib.rs]
@@ -108,18 +123,22 @@ flowchart LR
     tuiFacade --> tuiRuntime[src/tui/runtime.rs]
     tuiFacade --> tuiContext[src/tui/context.rs]
     tuiFacade --> tuiRender[src/tui/render.rs]
+    tuiRender --> tuiRenderModules[src/tui/render/*]
     tuiFacade --> tuiCommands[src/tui/commands.rs]
     tuiFacade --> tuiInteraction[src/tui/interaction.rs]
     tuiFacade --> tuiMarkdown[src/tui/markdown.rs]
     tuiFacade --> tuiState[src/tui/state.rs]
 
     workflowFacade --> actions[src/agent_workflow/actions.rs]
+    actions --> actionModules[src/agent_workflow/actions/*]
     workflowFacade --> prompts[src/agent_workflow/prompts.rs]
     workflowFacade --> summary[src/agent_workflow/summary.rs]
     workflowFacade --> weatherLookup[src/agent_workflow/weather_lookup.rs]
     workflowFacade --> weatherLocations[src/agent_workflow/weather_locations.rs]
+    weatherLocations --> weatherLocationModules[src/agent_workflow/weather_locations/*]
 
     promptsDir[prompt/*.yaml] --> llm
+    dashboard --> memory
 ```
 
 ### Weather Lookup Fallback
@@ -149,17 +168,34 @@ sequenceDiagram
     end
 ```
 
+### Location-Free Weather Guard
+
+```mermaid
+flowchart LR
+    Prompt["hello what's the weather today?"] --> Cleanup[Remove weather words]
+    Cleanup --> Residue["hello"]
+    Residue --> Guard[Greeting residue is not a location]
+    Guard --> Default["Default location: Seoul"]
+    Default --> Weather[Open-Meteo current weather]
+```
+
 ## Project Layout
 
 ```text
 src/main.rs              command dispatch and service wiring
 src/cli.rs               CLI definitions, defaults, runtime ids, prompt loading
+src/dashboard.rs         Valkey CLI/browser dashboard rendering
+src/usage.rs             token usage recording helpers for model calls
 src/tui.rs               TUI facade exporting run/config
 src/tui/                 TUI runtime, context, render, commands, input, state
+src/tui/render/          render tests/support modules
 src/agent_workflow.rs    agent workflow facade
 src/agent_workflow/      routing, prompt enrichment, summaries, weather fallback
+src/agent_workflow/actions/ weather/web/amplify/summary/memory routing modules
+src/agent_workflow/weather_locations/ weather aliases and location tests
 src/llm.rs               Rig model client, message shaping, token usage
-src/lib.rs               Valkey short term memory and prompt YAML archiving
+src/lib.rs               Valkey short term memory, usage events, prompt YAML archiving
+src/token_usage.rs       UTC daily token usage aggregation
 src/long_term_memory.rs  pgvector Markdown indexing and search
 src/weather.rs           Open-Meteo current weather client
 src/web_search.rs        Brave Search API client
@@ -332,6 +368,7 @@ Automatic context routing:
 | User intent | Automatic behavior |
 | --- | --- |
 | Weather question | Fetches Open-Meteo current weather. |
+| Location-free weather question like `hello what's the weather today?` | Strips greeting residue and defaults to Seoul. |
 | Weather follow-up like `부산은?` | Reuses weather context and treats the text as a new location. |
 | Pronoun weather follow-up like `weather there?` | Resolves the latest discussed place from chat history. |
 | Korean or non-English place names | Tries deterministic aliases, then LLM location normalization if needed. |
@@ -362,7 +399,15 @@ cargo run -- history
 cargo run -- history --session work
 cargo run -- search hello
 cargo run -- search hello --session work
+cargo run -- dashboard
+cargo run -- dashboard --limit 20 --preview-chars 160
+cargo run -- dashboard-server
 ```
+
+Open the web dashboard at `http://127.0.0.1:7878`. It reads Valkey chat
+sessions directly, shows UTC daily token usage with expandable date groups and
+clickable session links, and lets you choose whether conversation headers group
+by date, session, or user first.
 
 Search the web:
 
@@ -376,6 +421,7 @@ Fetch current weather:
 ```sh
 cargo run -- weather Seoul
 cargo run -- weather 부산은
+cargo run -- weather "hello what's the weather today?"
 cargo run -- weather "오늘 서울날씨는?"
 cargo run -- weather "부에노스아이레스 날씨는?"
 cargo run -- weather "아르헨티나 날씨는?"
@@ -469,6 +515,8 @@ Run checks before pushing:
 cargo fmt --check
 cargo test
 cargo clippy -- -D warnings
+cargo run --quiet -- dashboard --limit 5 --preview-chars 80
+cargo run --quiet -- weather "hello what's the weather today?" --reasoning-effort low
 git diff --check
 ```
 

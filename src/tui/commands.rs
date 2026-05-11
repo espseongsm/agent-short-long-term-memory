@@ -1,9 +1,10 @@
 use crate::{
     agent_workflow,
     llm::{LlmClient, ReasoningEffort},
+    usage,
     web_search::{DEFAULT_WEB_SEARCH_LIMIT, WebSearchClient},
 };
-use agent_memory::{ChatEntry, ChatRole, ShortTermMemory};
+use agent_memory::{ChatEntry, ChatRole, ShortTermMemory, TokenUsageSource};
 use anyhow::{Context, Result};
 use ratatui::DefaultTerminal;
 
@@ -165,6 +166,15 @@ pub(super) async fn submit_request_amplification(
     let amplified = match request_amplifier.chat_with_usage(&[], request).await {
         Ok(response) => {
             app.token_usage.add(response.usage);
+            usage::record_token_usage(
+                memory,
+                &config.user_id,
+                &config.session,
+                TokenUsageSource::RequestAmplifier,
+                response.usage,
+                config.ttl_seconds,
+            )
+            .context("failed to save request amplifier token usage")?;
             response.text
         }
         Err(error) => {
@@ -270,6 +280,15 @@ pub(super) async fn submit_conversation_summary(
     {
         Ok(response) => {
             app.token_usage.add(response.usage);
+            usage::record_token_usage(
+                memory,
+                &config.user_id,
+                &config.session,
+                TokenUsageSource::SummaryAgent,
+                response.usage,
+                config.ttl_seconds,
+            )
+            .context("failed to save summary token usage")?;
             response.text
         }
         Err(error) => {

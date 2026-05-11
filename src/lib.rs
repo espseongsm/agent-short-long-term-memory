@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     fs,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
@@ -7,12 +8,36 @@ use std::{
 use redis::Commands;
 use serde::{Deserialize, Serialize};
 
+mod token_usage;
+
+pub use token_usage::{
+    DailyTokenUsage, SessionTokenUsage, TokenUsageRecord, TokenUsageSource, TokenUsageTotals,
+    utc_date,
+};
+
 pub const DEFAULT_PROMPT_DIR: &str = "prompt";
 const SYSTEM_PROMPT_FILE: &str = "system.yaml";
 
 pub struct ShortTermMemory {
     connection: redis::Connection,
     namespace: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ChatSessionSummary {
+    pub session_id: String,
+    pub entry_count: usize,
+    pub user_ids: Vec<String>,
+    pub first_timestamp: u64,
+    pub last_timestamp: u64,
+    pub last_role: ChatRole,
+    pub last_content: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ChatConversation {
+    pub summary: ChatSessionSummary,
+    pub entries: Vec<ChatEntry>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -176,12 +201,108 @@ impl ShortTermMemory {
         Ok(search_entries(self.chat_history(session)?, query))
     }
 
-    fn namespaced_key(&self, key: &str) -> String {
+    pub fn chat_session_summaries(
+        &mut self,
+        limit: usize,
+    ) -> Result<Vec<ChatSessionSummary>, MemoryError> {
+        if limit == 0 {
+            return Err(MemoryError::InvalidInput("limit must be greater than zero"));
+        }
+
+        let mut summaries = self
+            .chat_conversations()?
+            .into_iter()
+            .map(|conversation| conversation.summary)
+            .collect::<Vec<_>>();
+
+        summaries.truncate(limit);
+
+        Ok(summaries)
+    }
+
+    pub fn chat_conversations(&mut self) -> Result<Vec<ChatConversation>, MemoryError> {
+        let chat_key_prefix = self.chat_history_key_prefix();
+        let mut conversations = self
+            .chat_history_keys()?
+            .into_iter()
+            .map(|key| {
+                let session_id = key
+                    .strip_prefix(&chat_key_prefix)
+                    .unwrap_or(&key)
+                    .to_string();
+                (session_id, key)
+            })
+            .map(|(session_id, key)| {
+                let values: Vec<String> = self.connection.lrange(&key, 0, -1)?;
+                let entries = values
+                    .into_iter()
+                    .map(|value| serde_json::from_str(&value).map_err(MemoryError::from))
+                    .collect::<Result<Vec<_>, _>>()?;
+
+                Ok(chat_session_summary(session_id, &entries)
+                    .map(|summary| ChatConversation { summary, entries }))
+            })
+            .collect::<Result<Vec<_>, MemoryError>>()?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+
+        conversations.sort_by(|left, right| {
+            right
+                .summary
+                .last_timestamp
+                .cmp(&left.summary.last_timestamp)
+                .then_with(|| right.summary.entry_count.cmp(&left.summary.entry_count))
+                .then_with(|| left.summary.session_id.cmp(&right.summary.session_id))
+        });
+
+        Ok(conversations)
+    }
+
+    pub(crate) fn keys_matching(&mut self, pattern: &str) -> Result<Vec<String>, MemoryError> {
+        let mut cursor = 0_u64;
+        let mut keys = Vec::new();
+
+        loop {
+            let (next_cursor, batch): (u64, Vec<String>) = redis::cmd("SCAN")
+                .arg(cursor)
+                .arg("MATCH")
+                .arg(pattern)
+                .arg("COUNT")
+                .arg(100)
+                .query(&mut self.connection)?;
+
+            keys.extend(batch);
+            cursor = next_cursor;
+
+            if cursor == 0 {
+                break;
+            }
+        }
+
+        Ok(keys)
+    }
+
+    fn chat_history_keys(&mut self) -> Result<Vec<String>, MemoryError> {
+        let pattern = self.chat_history_pattern();
+
+        self.keys_matching(&pattern)
+    }
+
+    pub(crate) fn namespaced_key(&self, key: &str) -> String {
         namespaced_key(&self.namespace, key)
     }
 
     fn chat_history_key(&self, session: &str) -> String {
         self.namespaced_key(&format!("chat:{session}"))
+    }
+
+    fn chat_history_key_prefix(&self) -> String {
+        self.namespaced_key("chat:")
+    }
+
+    fn chat_history_pattern(&self) -> String {
+        format!("{}*", self.chat_history_key_prefix())
     }
 }
 
@@ -218,6 +339,37 @@ pub fn search_entries(entries: Vec<ChatEntry>, query: &str) -> Vec<ChatEntry> {
         .collect()
 }
 
+fn chat_session_summary(session_id: String, entries: &[ChatEntry]) -> Option<ChatSessionSummary> {
+    let last_entry = entries.last()?;
+    let mut user_ids = BTreeSet::new();
+    let mut first_timestamp = u64::MAX;
+    let mut last_timestamp = 0;
+
+    for entry in entries {
+        if !entry.user_id.is_empty() {
+            user_ids.insert(entry.user_id.clone());
+        }
+        if entry.timestamp > 0 {
+            first_timestamp = first_timestamp.min(entry.timestamp);
+            last_timestamp = last_timestamp.max(entry.timestamp);
+        }
+    }
+
+    if first_timestamp == u64::MAX {
+        first_timestamp = 0;
+    }
+
+    Some(ChatSessionSummary {
+        session_id,
+        entry_count: entries.len(),
+        user_ids: user_ids.into_iter().collect(),
+        first_timestamp,
+        last_timestamp,
+        last_role: last_entry.role,
+        last_content: last_entry.content.clone(),
+    })
+}
+
 fn normalize_namespace(namespace: &str) -> String {
     namespace.trim_end_matches(':').to_string()
 }
@@ -234,125 +386,5 @@ fn unix_timestamp_seconds() -> u64 {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn normalizes_namespace_before_building_keys() {
-        let namespace = normalize_namespace("agent:short-term:");
-
-        assert_eq!(
-            namespaced_key(&namespace, "session"),
-            "agent:short-term:session"
-        );
-    }
-
-    #[test]
-    fn filters_chat_entries_case_insensitively() {
-        let entries = vec![
-            ChatEntry::new(ChatRole::User, "Remember the Valkey setup"),
-            ChatEntry::new(
-                ChatRole::Assistant,
-                "The server URL is redis://127.0.0.1:6379/",
-            ),
-        ];
-
-        assert_eq!(
-            search_entries(entries, "valkey"),
-            vec![ChatEntry::new(ChatRole::User, "Remember the Valkey setup")]
-        );
-    }
-
-    #[test]
-    fn creates_chat_entries_with_user_session_and_timestamp() {
-        let before = unix_timestamp_seconds();
-        let entry = ChatEntry::for_session("soonmo", "work", ChatRole::User, "hello");
-        let after = unix_timestamp_seconds();
-
-        assert_eq!(entry.user_id, "soonmo");
-        assert_eq!(entry.session_id, "work");
-        assert!(entry.timestamp >= before);
-        assert!(entry.timestamp <= after);
-    }
-
-    #[test]
-    fn reads_legacy_chat_entries_without_metadata() {
-        let entry: ChatEntry =
-            serde_json::from_str(r#"{"role":"user","content":"legacy"}"#).unwrap();
-
-        assert_eq!(entry, ChatEntry::new(ChatRole::User, "legacy"));
-    }
-
-    #[test]
-    fn saves_system_prompt_as_yaml() {
-        let prompt_dir = std::env::temp_dir().join(format!(
-            "agent-memory-system-prompt-test-{}-{}",
-            unix_timestamp_seconds(),
-            std::process::id()
-        ));
-
-        let path = save_system_prompt_yaml(&prompt_dir, "system instructions").unwrap();
-        let yaml = std::fs::read_to_string(path).unwrap();
-        let saved: SystemPromptArchiveEntry = serde_yaml::from_str(&yaml).unwrap();
-
-        assert_eq!(
-            saved,
-            SystemPromptArchiveEntry {
-                role: "system".to_string(),
-                prompt: "system instructions".to_string(),
-            }
-        );
-        assert!(prompt_dir.join("system.yaml").exists());
-
-        std::fs::remove_dir_all(prompt_dir).unwrap();
-    }
-
-    #[test]
-    #[ignore = "requires a Valkey server at VALKEY_URL or redis://127.0.0.1:6379/"]
-    fn remembers_recalls_and_forgets_with_valkey() {
-        let url =
-            std::env::var("VALKEY_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379/".to_string());
-        let mut memory = ShortTermMemory::connect(&url, "agent:test").unwrap();
-
-        memory
-            .remember("integration", "short lived value", 30)
-            .unwrap();
-
-        assert_eq!(
-            memory.recall("integration").unwrap(),
-            Some("short lived value".to_string())
-        );
-        assert!(memory.forget("integration").unwrap());
-        assert_eq!(memory.recall("integration").unwrap(), None);
-    }
-
-    #[test]
-    #[ignore = "requires a Valkey server at VALKEY_URL or redis://127.0.0.1:6379/"]
-    fn stores_and_searches_chat_history_with_valkey() {
-        let url =
-            std::env::var("VALKEY_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379/".to_string());
-        let mut memory = ShortTermMemory::connect(&url, "agent:test").unwrap();
-
-        memory.forget("chat:integration-session").unwrap();
-        let entry = ChatEntry::with_metadata(
-            "soonmo",
-            "integration-session",
-            1,
-            ChatRole::User,
-            "Searchable Valkey message",
-        );
-
-        memory
-            .append_chat_entry("integration-session", entry.clone(), 10, 30)
-            .unwrap();
-
-        assert_eq!(
-            memory
-                .search_chat_history("integration-session", "valkey")
-                .unwrap(),
-            vec![entry]
-        );
-
-        memory.forget("chat:integration-session").unwrap();
-    }
-}
+#[path = "lib_tests.rs"]
+mod tests;
