@@ -18,6 +18,14 @@
 - README에 코드 레이아웃을 추가해 빌드/사용 설명과 함께 주요 모듈의 역할을 빠르게 파악할 수 있게 했다.
 - PRD와 기본 모델을 맞추고 TUI 마우스 드래그 대화 선택 복사, 소수점 경과 시간 표시와 세션 token usage 표시, 한국어/외국 날씨 위치 정규화와 LLM fallback, `it/there` 날씨 후속 질문 해석, 자동 대화 요약 서브에이전트, `prompt/` YAML 기반 agent prompt를 추가했으며, 긴 `main`/`tui`/`agent_workflow` 소스를 책임별 모듈로 분리했다.
 
+## 2026-05-11 (월요일)
+
+- `README 2.md`와 기존 README를 통합해 대문자 `README.md` 하나로 정리하고, Mermaid 런타임 흐름/모듈 맵/날씨 fallback 다이어그램을 포함한 최신 프로젝트 문서로 재구성했다.
+- pgvector 장기 메모리를 기본 로컬 URL로 설정하고, 일반 TUI/chat 시작 전에 pgvector 연결과 스키마 초기화를 검증해 서비스가 꺼져 있으면 명확히 실패하도록 했다.
+- `long-term-index`의 기본 Markdown 경로를 로컬 Obsidian/iCloud 메모리 위치로 맞추고, pgvector ranking을 보강하되 일반 질문이 아닌 long-term memory/메모/노트/Markdown 요청에서만 검색하도록 자동 라우팅을 좁혔다.
+- PRD의 long term memory 상태를 실제 구현에 맞춰 갱신하고, 완전 자동 Docker/bootstrap과 자동 indexing은 후속 계획으로 남겨 두었다.
+- `cargo fmt --check`, `cargo test`, `cargo clippy -- -D warnings`, `git diff --check`를 통과한 뒤 `codex/readme-architecture-visuals` 브랜치를 GitHub에 push하고 draft PR #7을 열었다.
+
 ### 검증
 
 ```sh

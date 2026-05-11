@@ -18,7 +18,7 @@ long term memory, and Rig's OpenAI-compatible provider path.
   - web search through Brave Search API
   - vague request amplification through a sub-agent
   - saved conversation summaries through a summary sub-agent
-  - local Markdown long term memory through pgvector
+  - local Markdown long term memory through pgvector for memory/notes requests
 - Keeps agent and sub-agent prompts in `prompt/*.yaml`.
 - Shows model activity, elapsed time, session token usage, and a Rust + Rig
   runtime banner in the TUI.
@@ -69,13 +69,13 @@ flowchart TD
     Router --> Weather{Weather request?}
     Router --> Web{Current web context?}
     Router --> Amplifier{Vague request?}
-    Router --> Ltm{pgvector available?}
+    Router --> Ltm{Memory or notes request?}
 
     Summary -->|yes| SummaryAgent[summary agent prompt]
     Weather -->|yes| WeatherLookup[Open-Meteo weather lookup]
     Web -->|yes| Brave[Brave Search API]
     Amplifier -->|yes| AmplifierAgent[request amplifier prompt]
-    Ltm -->|yes| PgSearch[pgvector Markdown search]
+    Ltm -->|yes and pgvector available| PgSearch[pgvector Markdown search]
 
     SummaryAgent --> Prompt[Final enriched prompt]
     WeatherLookup --> Prompt
@@ -338,7 +338,7 @@ Automatic context routing:
 | Current-information prompt | Searches Brave before the final model answer. |
 | Vague request | Calls the request amplifier sub-agent first. |
 | Conversation recap request | Calls the summary sub-agent first. |
-| pgvector is available | Searches indexed Markdown memory before the final answer. |
+| Memory or notes request | Searches indexed Markdown memory when pgvector is available. |
 
 ## CLI Usage
 
