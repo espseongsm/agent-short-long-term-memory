@@ -80,21 +80,22 @@ impl LongTermMemory {
 
     async fn upsert_chunk(&self, chunk: &MarkdownChunk) -> Result<()> {
         let embedding = embedding_literal(&text_embedding(&chunk.content));
+        let embedding = vector_cast_sql(&embedding);
         let chunk_index = i32::try_from(chunk.chunk_index).context("chunk index is too large")?;
         let source_path = chunk.source_path.to_string_lossy().to_string();
+        let statement = format!(
+            "INSERT INTO agent_long_term_memory
+                (source_path, chunk_index, content, embedding, updated_at)
+             VALUES ($1, $2, $3, {embedding}, now())
+             ON CONFLICT (source_path, chunk_index)
+             DO UPDATE SET
+                content = EXCLUDED.content,
+                embedding = EXCLUDED.embedding,
+                updated_at = now()"
+        );
 
         self.client
-            .execute(
-                "INSERT INTO agent_long_term_memory
-                    (source_path, chunk_index, content, embedding, updated_at)
-                 VALUES ($1, $2, $3, $4::vector, now())
-                 ON CONFLICT (source_path, chunk_index)
-                 DO UPDATE SET
-                    content = EXCLUDED.content,
-                    embedding = EXCLUDED.embedding,
-                    updated_at = now()",
-                &[&source_path, &chunk_index, &chunk.content, &embedding],
-            )
+            .execute(&statement, &[&source_path, &chunk_index, &chunk.content])
             .await
             .context("failed to upsert markdown chunk into pgvector")?;
 
@@ -113,19 +114,37 @@ impl LongTermMemory {
         self.init().await?;
 
         let embedding = embedding_literal(&text_embedding(query));
+        let embedding = vector_cast_sql(&embedding);
         let limit = i64::try_from(limit).context("long-term search limit is too large")?;
+        let statement = format!(
+            "WITH query_terms AS (
+                SELECT lower(term) AS term
+                FROM regexp_split_to_table($2, '[^[:alnum:]]+') AS term
+                WHERE char_length(term) >= 3
+             ),
+             ranked AS (
+                SELECT source_path,
+                       chunk_index,
+                       content,
+                       1 - (embedding <=> {embedding}) AS vector_score,
+                       (
+                           SELECT count(*)
+                           FROM query_terms
+                           WHERE lower(content) LIKE '%' || term || '%'
+                       ) AS lexical_matches
+                FROM agent_long_term_memory
+             )
+             SELECT source_path,
+                    chunk_index,
+                    content,
+                    vector_score + lexical_matches::double precision AS score
+             FROM ranked
+             ORDER BY lexical_matches DESC, score DESC, vector_score DESC
+             LIMIT $1"
+        );
         let rows = self
             .client
-            .query(
-                "SELECT source_path,
-                        chunk_index,
-                        content,
-                        1 - (embedding <=> $1::vector) AS score
-                 FROM agent_long_term_memory
-                 ORDER BY embedding <=> $1::vector
-                 LIMIT $2",
-                &[&embedding, &limit],
-            )
+            .query(&statement, &[&limit, &query])
             .await
             .context("failed to search pgvector long-term memory")?;
 
@@ -329,6 +348,16 @@ fn embedding_literal(vector: &[f32]) -> String {
         .join(",");
 
     format!("[{values}]")
+}
+
+fn vector_cast_sql(embedding: &str) -> String {
+    debug_assert!(
+        embedding
+            .chars()
+            .all(|character| matches!(character, '[' | ']' | ',' | '.' | '-' | '0'..='9'))
+    );
+
+    format!("'{embedding}'::vector")
 }
 
 pub fn default_chunk_chars() -> usize {

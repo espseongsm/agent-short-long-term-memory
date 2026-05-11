@@ -31,7 +31,7 @@ TUI / chat CLI
  |-- user input
  |-- immediate local user message
  |-- prompt/*.yaml agent and sub-agent prompts
- |-- optional automatic context routing
+ |-- automatic context routing
  |     |-- summary agent when the user asks to sum up the saved conversation
  |     |-- current weather
  |     |   |-- cleanup/alias -> Open-Meteo -> weather location normalizer -> Open-Meteo retry
@@ -64,7 +64,7 @@ Status is based on the repo state on 2026-05-07.
 | Model provider | Done | Rig OpenAI-compatible provider with HTTPS/TLS support. |
 | Default model | Done | `gpt-5.5`. |
 | Short term memory | Done | Valkey stores chat history and simple key/value memory. |
-| Long term memory | Done | pgvector indexes and searches local Markdown files. |
+| Long term memory | Partial | pgvector is required at startup with a default local URL and `long-term-index` defaults to the local Markdown path, but full operation still requires a running pgvector database and indexed data. |
 | Weather context | Done | Open-Meteo current weather routing, CLI access, Korean aliases, and LLM location fallback. |
 | Web search context | Done | Brave Search API routing, CLI access, and TUI commands. |
 | Request amplifier | Done | Sub-agent expands vague requests automatically and by command. |
@@ -124,9 +124,11 @@ Valkey reference: <https://valkey.io/topics/>
 | ID | Requirement | Status |
 | --- | --- | --- |
 | LTM-1 | Use pgvector for long term memory. | Done |
-| LTM-2 | Use local Markdown files(/Users/soonmoseong/Library/Mobile Documents/iCloud~md~obsidian/) as the data source. | Done |
+| LTM-2 | Use local Markdown files(`/Users/soonmoseong/Library/Mobile Documents/iCloud~md~obsidian/`) as the default data source. | Done |
 | LTM-3 | Provide CLI indexing and search commands. | Done |
-| LTM-4 | Add relevant long term memory context automatically when `PGVECTOR_URL` is configured. | Done |
+| LTM-4 | Add relevant long term memory context automatically when pgvector is available and Markdown data has been indexed. | Done |
+| LTM-5 | Require pgvector at app startup and fail clearly when it is unavailable. | Done |
+| LTM-6 | Make long term memory fully operational by default without manual pgvector Docker setup/indexing. | Planned |
 
 ### 5.5 Tools and Context
 

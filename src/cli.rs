@@ -12,10 +12,13 @@ use serde::Deserialize;
 use crate::{llm, long_term_memory, web_search};
 
 const DEFAULT_VALKEY_URL: &str = "redis://127.0.0.1:6379/";
+const DEFAULT_PGVECTOR_URL: &str = "postgres://postgres:postgres@127.0.0.1:5432/agent_memory";
 const DEFAULT_NAMESPACE: &str = "agent:short-term";
 const DEFAULT_HISTORY_LIMIT: usize = 20;
 const DEFAULT_CHAT_TTL_SECONDS: u64 = 86_400;
 const DEFAULT_OPENAI_MODEL: &str = "gpt-5.5";
+const DEFAULT_LONG_TERM_MEMORY_PATH: &str =
+    "/Users/soonmoseong/Library/Mobile Documents/iCloud~md~obsidian/";
 
 const AGENT_PROMPT_YAML: &str = include_str!("../prompt/agent.yaml");
 const REQUEST_AMPLIFIER_PROMPT_YAML: &str = include_str!("../prompt/request_amplifier.yaml");
@@ -82,8 +85,8 @@ pub(crate) struct Cli {
     #[arg(long, env = "AGENT_USER_ID")]
     pub(crate) user_id: Option<String>,
 
-    #[arg(long, env = "PGVECTOR_URL")]
-    pub(crate) pgvector_url: Option<String>,
+    #[arg(long, env = "PGVECTOR_URL", default_value = DEFAULT_PGVECTOR_URL)]
+    pub(crate) pgvector_url: String,
 
     #[command(subcommand)]
     pub(crate) command: Option<Command>,
@@ -174,6 +177,7 @@ pub(crate) enum Command {
         reasoning_effort: Option<llm::ReasoningEffort>,
     },
     LongTermIndex {
+        #[arg(env = "LONG_TERM_MEMORY_PATH", default_value = DEFAULT_LONG_TERM_MEMORY_PATH)]
         path: PathBuf,
 
         #[arg(long, default_value_t = long_term_memory::default_chunk_chars())]
@@ -265,6 +269,25 @@ mod tests {
                 reasoning_effort, ..
             } => assert_eq!(reasoning_effort, Some(llm::ReasoningEffort::Low)),
             _ => panic!("default command should open the TUI"),
+        }
+    }
+
+    #[test]
+    fn cli_uses_default_pgvector_url() {
+        let cli = Cli::try_parse_from(["agent_memory"]).unwrap();
+
+        assert_eq!(cli.pgvector_url, DEFAULT_PGVECTOR_URL);
+    }
+
+    #[test]
+    fn long_term_index_uses_default_markdown_path() {
+        let cli = Cli::try_parse_from(["agent_memory", "long-term-index"]).unwrap();
+
+        match cli.command.unwrap() {
+            Command::LongTermIndex { path, .. } => {
+                assert_eq!(path, PathBuf::from(DEFAULT_LONG_TERM_MEMORY_PATH));
+            }
+            _ => panic!("command should index long-term memory"),
         }
     }
 
