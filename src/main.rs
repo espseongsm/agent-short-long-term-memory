@@ -103,7 +103,7 @@ async fn main() -> Result<()> {
     }
 
     if let Command::LongTermIndex { path, chunk_chars } = &command {
-        let long_term = connect_long_term_memory(cli.pgvector_url.as_deref()).await?;
+        let long_term = connect_long_term_memory(&cli.pgvector_url).await?;
         let indexed = long_term
             .index_markdown_path(path, *chunk_chars)
             .await
@@ -114,7 +114,7 @@ async fn main() -> Result<()> {
     }
 
     if let Command::LongTermSearch { query, limit } = &command {
-        let long_term = connect_long_term_memory(cli.pgvector_url.as_deref()).await?;
+        let long_term = connect_long_term_memory(&cli.pgvector_url).await?;
         let results = long_term
             .search(query, *limit)
             .await
@@ -150,6 +150,7 @@ async fn main() -> Result<()> {
 
     let mut memory = ShortTermMemory::connect(&cli.valkey_url, &cli.namespace)
         .with_context(|| format!("failed to connect to Valkey at {}", cli.valkey_url))?;
+    verify_long_term_memory(&cli.pgvector_url).await?;
 
     match command {
         Command::Tui {
@@ -175,7 +176,7 @@ async fn main() -> Result<()> {
                     amplifier_preamble: prompts.request_amplifier.clone(),
                     summary_preamble: prompts.summary_agent.clone(),
                     weather_translator_preamble: prompts.weather_location_normalizer.clone(),
-                    pgvector_url: cli.pgvector_url,
+                    pgvector_url: Some(cli.pgvector_url.clone()),
                 },
             )
             .await?;
@@ -226,7 +227,7 @@ async fn main() -> Result<()> {
             }
 
             let prompt_for_llm = agent_workflow::automatic_chat_prompt(
-                cli.pgvector_url.as_deref(),
+                Some(cli.pgvector_url.as_str()),
                 &history,
                 &user_entry.content,
                 &model,
@@ -333,12 +334,20 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn connect_long_term_memory(
-    pgvector_url: Option<&str>,
-) -> Result<long_term_memory::LongTermMemory> {
-    let pgvector_url = pgvector_url.context("PGVECTOR_URL must be set for long-term memory")?;
+async fn connect_long_term_memory(pgvector_url: &str) -> Result<long_term_memory::LongTermMemory> {
+    long_term_memory::connect(pgvector_url)
+        .await
+        .with_context(|| format!("failed to connect to pgvector at {pgvector_url}"))
+}
 
-    long_term_memory::connect(pgvector_url).await
+async fn verify_long_term_memory(pgvector_url: &str) -> Result<()> {
+    let long_term = connect_long_term_memory(pgvector_url).await?;
+    long_term
+        .init()
+        .await
+        .with_context(|| format!("failed to initialize pgvector schema at {pgvector_url}"))?;
+
+    Ok(())
 }
 
 fn print_chat_entries(entries: Vec<ChatEntry>) {
